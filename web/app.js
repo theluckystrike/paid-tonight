@@ -42,14 +42,29 @@ function lineTotalCents(item) {
   return roundHalfUp(num, den);
 }
 
+// Same rule as the server (src/money.ts) and PayPal: tax per line, each rounded half-up; with an invoice discount,
+// tax on the discounted subtotal. The server re-checks PayPal's own total before anything is sent.
+function percentBps(value) {
+  const p = parseDecimal(value); // "23" -> 2300, "8.5" -> 850: percent in hundredths, rounded half-up like the server
+  return roundHalfUp(p.coeff * 100n, 10n ** BigInt(p.scale));
+}
+
 function computeTotals(draft) {
-  let subtotal = 0n;
-  for (const item of draft.items) subtotal += lineTotalCents(item);
-  let tax = 0n;
-  const pct = parseInt(draft.taxPercent, 10);
-  if (Number.isFinite(pct) && pct > 0) tax = roundHalfUp(subtotal * BigInt(pct), 100n);
-  const total = subtotal + tax;
-  return { subtotal: centsToStr(subtotal), tax: centsToStr(tax), total: centsToStr(total) };
+  const lines = draft.items.map(lineTotalCents);
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  const d = parseDecimal(draft.discount);
+  let discount = roundHalfUp(d.coeff * 100n, 10n ** BigInt(d.scale));
+  if (discount > subtotal) discount = subtotal;
+  const bps = draft.taxPercent == null ? 0n : percentBps(draft.taxPercent);
+  const tax = discount > 0n ? roundHalfUp((subtotal - discount) * bps, 10000n) : lines.reduce((a, c) => a + roundHalfUp(c * bps, 10000n), 0n);
+  return { subtotal: centsToStr(subtotal), discount: centsToStr(discount), tax: centsToStr(tax), total: centsToStr(subtotal - discount + tax) };
+}
+
+function newDraftId() {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  return Array.from(bytes, (b) => abc[b % abc.length]).join("") + Date.now().toString(36).slice(-4).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
 function centsToStr(cents) {
@@ -128,7 +143,7 @@ function normalizeItem(raw) {
 function normalizeTotals(raw) {
   if (!raw || typeof raw !== "object") return null;
   if (raw.subtotal == null || raw.tax == null || raw.total == null) return null;
-  return { subtotal: moneyText(raw.subtotal), tax: moneyText(raw.tax), total: moneyText(raw.total) };
+  return { subtotal: moneyText(raw.subtotal), discount: moneyText(raw.discount == null ? "0" : raw.discount), tax: moneyText(raw.tax), total: moneyText(raw.total) };
 }
 
 function normalizeDraft(data) {
@@ -140,6 +155,7 @@ function normalizeDraft(data) {
     currency: currencyOf(raw.currency),
     items: Array.isArray(raw.items) ? raw.items.map(normalizeItem).filter(Boolean) : [],
     taxPercent: raw.taxPercent == null || raw.taxPercent === "" ? null : String(raw.taxPercent),
+    discount: raw.discount == null || raw.discount === "" ? null : moneyText(raw.discount),
     note: raw.note == null || raw.note === "" ? null : String(raw.note),
     warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String).slice(0, 20) : [],
   };
@@ -194,7 +210,7 @@ async function sendDraftRequest(draft, fetchFn) {
   const data = await request("/api/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ draft }),
+    body: JSON.stringify({ draft, draftId: state.draftId }),
   }, fetchFn);
   if (!data || typeof data !== "object") throw new ApiError(0, "The server returned an unexpected response.");
   return {
@@ -202,6 +218,9 @@ async function sendDraftRequest(draft, fetchFn) {
     number: asText(data.number, asText(data.id, "")),
     qr: asText(data.qr, ""),
     href: asText(data.href, ""),
+    amount: data.amount && data.amount.value ? `${data.amount.value} ${asText(data.amount.currency, "")}` : "",
+    emailed: Boolean(data.emailed),
+    partial: Boolean(data.partial),
   };
 }
 
@@ -218,18 +237,19 @@ async function draftReminderRequest(id, fetchFn) {
     body: JSON.stringify({ id }),
   }, fetchFn);
   if (!data || typeof data !== "object") throw new ApiError(0, "The server returned an unexpected response.");
+  const r = data.reminder && typeof data.reminder === "object" ? data.reminder : data;
   return {
-    subject: asText(data.subject, ""),
-    note: asText(data.note, ""),
-    tone: asText(data.tone, "friendly"),
+    subject: asText(r.subject, ""),
+    note: asText(r.note, ""),
+    tone: asText(r.tone, "friendly"),
   };
 }
 
-async function sendReminderRequest(id, subject, note, fetchFn) {
+async function sendReminderRequest(id, fetchFn) {
   await request("/api/remind", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, subject, note }),
+    body: JSON.stringify({ id }),
   }, fetchFn);
   return true;
 }
@@ -382,6 +402,20 @@ function buildPreview(ui) {
   taxInput.max = "30";
   taxInput.step = "any";
   taxInput.placeholder = "e.g. 23";
+  const currencySelect = document.createElement("select");
+  currencySelect.className = "input";
+  currencySelect.setAttribute("aria-label", "Currency");
+  for (const code of ["USD", "EUR", "GBP", "PLN", "CAD", "AUD"]) {
+    const opt = document.createElement("option");
+    opt.value = code;
+    opt.textContent = code;
+    if (code === state.draft.currency) opt.selected = true;
+    currencySelect.append(opt);
+  }
+  const discountInput = makeInput("number", state.draft.discount || "", "Discount");
+  discountInput.min = "0";
+  discountInput.step = "0.01";
+  discountInput.placeholder = "Amount off the whole invoice (optional)";
   const noteInput = el("textarea", "input input--note");
   noteInput.value = state.draft.note || "";
   noteInput.rows = 3;
@@ -397,6 +431,8 @@ function buildPreview(ui) {
     el("label", "field-label", "Customer name"), nameInput,
     el("label", "field-label", "Email"), emailInput,
     el("h3", "card__sub", "Items"), itemsWrap, addBtn,
+    el("label", "field-label", "Currency"), currencySelect,
+    el("label", "field-label", "Discount"), discountInput,
     el("label", "field-label", "Tax (percent)"), taxInput,
     el("label", "field-label", "Note"), noteInput,
     totalsBox, warningsBox,
@@ -416,6 +452,9 @@ function buildPreview(ui) {
     addItem(itemsWrap, item, sync);
     sync();
   });
+  if (!state.draftId) state.draftId = newDraftId();
+  currencySelect.addEventListener("change", () => { state.draft.currency = currencySelect.value; sync(); });
+  discountInput.addEventListener("input", () => { state.draft.discount = discountInput.value.trim() || null; sync(); });
   wirePreviewControls(ui, { nameInput, emailInput, taxInput, noteInput, backBtn, sendBtn }, sync);
 
   renderTotals(totalsBox, warningsBox);
@@ -453,6 +492,7 @@ async function handleMake(ui) {
   clearError(ui.newError);
   try {
     const { draft, totals } = await createDraftRequest(text);
+    state.draftId = newDraftId(); // one id per draft: a retry of the same send can never create a second invoice
     state.draft = draft;
     state.totals = totals;
     buildPreview(ui);
@@ -480,9 +520,10 @@ async function handleSend(ui, sendBtn) {
 function showSuccess(ui, result) {
   ui.preview.hidden = true;
   const card = el("div", "card card--success");
-  card.append(el("h2", "card__title", "Invoice sent"));
-  card.append(el("p", "muted", "Customer can scan to pay now."));
-  card.append(el("p", "success__number", `Invoice ${result.number || result.id || ""}`));
+  card.append(el("h2", "card__title", result.emailed ? "Invoice sent" : "Invoice ready"));
+  card.append(el("p", "muted", result.emailed ? "PayPal emailed it to your customer. They can also scan to pay now." : "No email on the invoice: show the QR code or share the pay link."));
+  card.append(el("p", "success__number", `Invoice ${result.number || result.id || ""}${result.amount ? " \u00b7 " + result.amount : ""}`));
+  if (result.partial) card.append(el("p", "muted", "The invoice is sent. PayPal did not return every detail just now; open it from the Unpaid tab."));
 
   if (result.qr) {
     const img = document.createElement("img");
@@ -501,11 +542,17 @@ function showSuccess(ui, result) {
     link.rel = "noopener";
     link.textContent = "Open invoice";
     card.append(link);
+    const copyBtn = el("button", "btn btn--ghost", "Copy pay link");
+    copyBtn.type = "button";
+    copyBtn.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(href); copyBtn.textContent = "Copied"; } catch (err) { copyBtn.textContent = "Copy failed"; }
+    });
+    card.append(copyBtn);
   }
 
   const againBtn = el("button", "btn btn--primary", "Make another");
   againBtn.type = "button";
-  againBtn.addEventListener("click", () => { ui.success.replaceChildren(); ui.success.hidden = true; });
+  againBtn.addEventListener("click", () => { ui.success.replaceChildren(); ui.success.hidden = true; state.draftId = null; });
   card.append(againBtn);
 
   ui.success.replaceChildren(card);
@@ -583,29 +630,39 @@ function buildReminderEditor(ui, invoice, reminder) {
   const backBtn = el("button", "btn btn--ghost", "Back");
   backBtn.type = "button";
 
+  const emailBtn = el("button", "btn btn--ghost", "Email this message");
+  emailBtn.type = "button";
+  const copyBtn = el("button", "btn btn--ghost", "Copy message");
+  copyBtn.type = "button";
+  sendBtn.textContent = "Send PayPal reminder";
+
   card.append(
+    el("p", "muted", "PayPal sends its own standard reminder with the pay button. It does not use custom text, so the message below is yours to send by email or text, in your own words."),
     el("label", "field-label", "Subject"), subject,
     el("label", "field-label", "Message"), note,
     errorBox,
-    actionsEl([backBtn, sendBtn]),
+    actionsEl([backBtn, copyBtn, emailBtn, sendBtn]),
   );
 
+  copyBtn.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(note.value.trim()); copyBtn.textContent = "Copied"; } catch (err) { showError(errorBox, "Copy failed: select the message and copy it."); }
+  });
+  emailBtn.addEventListener("click", () => {
+    if (!invoice.customerEmail) { showError(errorBox, "This invoice has no customer email."); return; }
+    const url = "mailto:" + encodeURIComponent(invoice.customerEmail) + "?subject=" + encodeURIComponent(subject.value.trim()) + "&body=" + encodeURIComponent(note.value.trim());
+    window.location.href = url;
+  });
   sendBtn.addEventListener("click", async () => {
-    const subj = subject.value.trim();
-    const body = note.value.trim();
-    if (!subj || !body) {
-      showError(errorBox, "Add a subject and a message.");
-      return;
-    }
     sendBtn.disabled = true;
     backBtn.disabled = true;
     try {
-      await sendReminderRequest(invoice.id, subj, body);
-      card.replaceChildren(el("p", "success", "Reminder sent."));
+      await sendReminderRequest(invoice.id);
+      sendBtn.textContent = "PayPal reminder sent";
     } catch (err) {
       sendBtn.disabled = false;
-      backBtn.disabled = false;
       showError(errorBox, friendlyMessage(err));
+    } finally {
+      backBtn.disabled = false;
     }
   });
 

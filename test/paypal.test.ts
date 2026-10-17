@@ -251,16 +251,16 @@ test("listUnpaid: filters statuses and maps fields", async () => {
   assert.equal(listCall.search, "?page=1&page_size=50&total_required=true");
 });
 
-test("remind: posts subject, note and send_to_invoicer false", async () => {
+test("remind: posts only send_to_invoicer false (PayPal ignores custom subject and note)", async () => {
   const { fetch, calls } = makeFetch((req) =>
     req.path === "/v1/oauth2/token" ? tokenResponse() : new Response(null, { status: 204 }),
   );
   const pp = new PayPal("cid", "sec", fetch);
-  await pp.remind("INV-1", "Reminder", "Please pay.");
+  await pp.remind("INV-1");
   const remind = calls.find((c) => c.path.endsWith("/remind"));
   assert.ok(remind);
   assert.equal(remind.method, "POST");
-  assert.deepEqual(JSON.parse(remind.body ?? "{}"), { subject: "Reminder", note: "Please pay.", send_to_invoicer: false });
+  assert.deepEqual(JSON.parse(remind.body ?? "{}"), { send_to_invoicer: false });
 });
 
 test("non-2xx throws PayPalError with details description and debug_id", async () => {

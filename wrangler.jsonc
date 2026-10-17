@@ -5,6 +5,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "assets": { "directory": "./web", "binding": "ASSETS" },
   "ai": { "binding": "AI" },
+  "ratelimits": [{ "name": "AI_LIMIT", "namespace_id": "4712", "simple": { "limit": 6, "period": 60 } }],
   "kv_namespaces": [{ "binding": "LIMITS", "id": "ee603c3b703b4725b05b8ff79b36c9a9" }],
   "workers_dev": true,
   "observability": { "enabled": false },

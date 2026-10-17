@@ -35,22 +35,28 @@ function formatCents(cents: bigint): string {
   return `${sign}${intPart}.${fracPart.toString().padStart(2, "0")}`;
 }
 
-function taxCents(subtotalCents: bigint, taxPercent: string | null): bigint {
-  if (taxPercent == null) return 0n;
-  const bps = parseDecimal(taxPercent, 2);
-  return (subtotalCents * bps + 5000n) / 10000n;
+function lineCents(item: { quantity: string; unitAmount: string }): bigint {
+  return (parseDecimal(item.quantity, 3) * parseDecimal(item.unitAmount, 2) + 500n) / 1000n;
 }
 
+function percentTax(cents: bigint, bps: bigint): bigint {
+  return (cents * bps + 5000n) / 10000n;
+}
+
+/**
+ * Totals as PayPal computes them: tax per line, each line rounded half-up, then summed. With an invoice-level
+ * discount, tax is taken on the discounted subtotal. /api/send re-reads PayPal's own total and refuses to send
+ * when it differs, so a rounding difference can never reach a customer.
+ */
 export function totals(draft: InvoiceDraft): Totals {
-  let subtotal = 0n;
-  for (const item of draft.items) {
-    const quantity = parseDecimal(item.quantity, 3);
-    const unit = parseDecimal(item.unitAmount, 2);
-    subtotal += (quantity * unit + 500n) / 1000n;
-  }
-  const tax = taxCents(subtotal, draft.taxPercent);
-  const total = subtotal + tax;
-  return { subtotal: formatCents(subtotal), tax: formatCents(tax), total: formatCents(total) };
+  const lines = draft.items.map(lineCents);
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  const discount = draft.discount ? parseDecimal(draft.discount, 2) : 0n;
+  if (discount > subtotal) throw new Error("discount is larger than the subtotal");
+  const bps = draft.taxPercent == null ? 0n : parseDecimal(draft.taxPercent, 2);
+  const tax = discount > 0n ? percentTax(subtotal - discount, bps) : lines.reduce((a, c) => a + percentTax(c, bps), 0n);
+  const total = subtotal - discount + tax;
+  return { subtotal: formatCents(subtotal), discount: formatCents(discount), tax: formatCents(tax), total: formatCents(total) };
 }
 
 export function toPayPalItems(draft: InvoiceDraft): PayPalItem[] {

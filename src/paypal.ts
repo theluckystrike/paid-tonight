@@ -35,23 +35,29 @@ export class PayPal {
     return this.tokenValue;
   }
 
-  async createDraft(draft: InvoiceDraft, invoicer: { businessName: string }): Promise<{ id: string; href: string }> {
+  async createDraft(draft: InvoiceDraft, invoicer: { businessName: string }, invoiceNumber?: string): Promise<{ id: string; href: string }> {
     const detail: Record<string, unknown> = {
       currency_code: draft.currency,
       payment_term: { term_type: "DUE_ON_RECEIPT" },
     };
+    // A fixed invoice number per draft: PayPal refuses a second invoice with the same number, so a retry cannot duplicate.
+    if (invoiceNumber) detail.invoice_number = invoiceNumber;
     if (draft.note != null) detail.note = draft.note;
     const billing: Record<string, unknown> = { name: { full_name: draft.customerName } };
     if (draft.customerEmail != null) billing.email_address = draft.customerEmail;
-    const payload = {
+    const payload: Record<string, unknown> = {
       detail,
       invoicer: { business_name: invoicer.businessName },
       primary_recipients: [{ billing_info: billing }],
       items: toPayPalItems(draft),
     };
+    if (draft.discount && draft.discount !== "0.00") {
+      payload.amount = { breakdown: { discount: { invoice_discount: { amount: { currency_code: draft.currency, value: draft.discount } } } } };
+    }
     const res = await this.request("POST", "/v2/invoicing/invoices", {
       body: JSON.stringify(payload),
       contentType: "application/json",
+      requestId: invoiceNumber,
     });
     return idAndHref(await res.json());
   }
@@ -92,17 +98,19 @@ export class PayPal {
     return out;
   }
 
-  async remind(id: string, subject: string, note: string): Promise<void> {
+  /** PayPal sends its own reminder text (it ignores custom subject and note on /remind); the AI message is shared separately. */
+  async remind(id: string): Promise<void> {
     await this.request("POST", `/v2/invoicing/invoices/${encodeURIComponent(id)}/remind`, {
-      body: JSON.stringify({ subject, note, send_to_invoicer: false }),
+      body: JSON.stringify({ send_to_invoicer: false }),
       contentType: "application/json",
     });
   }
 
-  private async request(method: string, path: string, opts: { body?: string; contentType?: string } = {}): Promise<Response> {
+  private async request(method: string, path: string, opts: { body?: string; contentType?: string; requestId?: string } = {}): Promise<Response> {
     const token = await this.token();
     const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
     if (opts.contentType) headers["Content-Type"] = opts.contentType;
+    if (opts.requestId) headers["PayPal-Request-Id"] = opts.requestId;
     return this.rawRequest(method, path, { headers, body: opts.body });
   }
 
@@ -189,11 +197,19 @@ function mapInvoice(raw: unknown): UnpaidInvoice | null {
     customerEmail,
     total: typeof amount.value === "string" ? amount.value : "0.00",
     currency: typeof amount.currency_code === "string" ? amount.currency_code : "",
-    dueDate: typeof detail.due_date === "string" ? detail.due_date : null,
+    dueDate: dueDateOf(detail),
     invoiceDate: typeof detail.invoice_date === "string" ? detail.invoice_date : null,
   };
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
+}
+
+/** PayPal keeps the due date in detail.payment_term.due_date; due-on-receipt invoices fall back to the invoice date. */
+function dueDateOf(detail: Record<string, unknown>): string | null {
+  const term = isObject(detail.payment_term) ? detail.payment_term : {};
+  if (typeof term.due_date === "string") return term.due_date;
+  if (typeof detail.due_date === "string") return detail.due_date;
+  return typeof detail.invoice_date === "string" ? detail.invoice_date : null;
 }

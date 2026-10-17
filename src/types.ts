@@ -7,11 +7,13 @@ export interface InvoiceDraft {
   currency: string;
   items: LineItem[];
   taxPercent: string | null;
+  /** Invoice-level discount, a positive amount taken off before tax. */
+  discount?: string | null;
   note: string | null;
   warnings: string[];
 }
 
-export interface Totals { subtotal: string; tax: string; total: string }
+export interface Totals { subtotal: string; discount: string; tax: string; total: string }
 
 export interface UnpaidInvoice {
   id: string; number: string; status: string; customerName: string; customerEmail: string | null;

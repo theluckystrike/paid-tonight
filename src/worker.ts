@@ -4,6 +4,7 @@ import { totals } from "./money.js";
 import { PayPal } from "./paypal.js";
 import { draftReminder } from "./reminder.js";
 import { ExtractError, PayPalError, type AiRunner, type InvoiceDraft } from "./types.js";
+import { DraftInvalid, validateDraft } from "./validate.js";
 
 interface Env {
   AI: { run: (model: string, input: unknown) => Promise<{ response?: unknown }> };
@@ -12,6 +13,7 @@ interface Env {
   PAYPAL_CLIENT_ID?: string;
   PAYPAL_CLIENT_SECRET?: string;
   BUSINESS_NAME?: string;
+  AI_LIMIT?: { limit(o: { key: string }): Promise<{ success: boolean }> };
 }
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -31,12 +33,16 @@ function paypal(env: Env): PayPal {
 }
 
 function fail(err: unknown): Response {
+  if (err instanceof DraftInvalid) return Response.json({ error: "Check the draft: " + err.fields.join("; "), fields: err.fields }, { status: 422 });
   if (err instanceof ExtractError) return Response.json({ error: err.message }, { status: 422 });
   if (err instanceof PayPalError) return Response.json({ error: `PayPal: ${err.message}`, debugId: err.debugId ?? null }, { status: err.status >= 400 && err.status < 600 ? err.status : 502 });
   return Response.json({ error: "Something went wrong. Please try again." }, { status: 500 });
 }
 
 async function body<T>(request: Request): Promise<T> {
+  // JSON only (parsed MIME type): a cross-site form or text/plain post cannot reach PayPal through this server.
+  const essence = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+  if (essence !== "application/json") throw new ExtractError("Send JSON with content-type application/json.");
   const text = await request.text();
   if (text.length > 20_000) throw new ExtractError("The request is too large.");
   try { return JSON.parse(text) as T; } catch { throw new ExtractError("Send JSON."); }
@@ -44,36 +50,88 @@ async function body<T>(request: Request): Promise<T> {
 
 type Handler = (request: Request, env: Env) => Promise<Response>;
 
+/** Per-address brake on AI calls, so one visitor cannot use up the shared daily cap. */
+async function perAddress(req: Request, env: Env): Promise<void> {
+  const key = req.headers.get("cf-connecting-ip") ?? "local";
+  if (env.AI_LIMIT && !(await env.AI_LIMIT.limit({ key })).success) throw new ExtractError("Too many drafts from this address. Wait a minute and try again.");
+}
+
+const DRAFT_ID = /^[A-Za-z0-9]{8,16}$/;
+interface SentRecord { invoiceId: string; sent: boolean }
+
+/**
+ * Create, check, send. The draft is validated first; the invoice number comes from the browser's draft id, so a
+ * retry finds the same invoice instead of creating a second one; PayPal's own total must equal ours before the
+ * invoice is sent; the QR code and the invoice read after sending are optional (partial success, never an error).
+ */
+async function send(req: Request, env: Env): Promise<Response> {
+  const input = await body<{ draft: unknown; draftId?: string }>(req);
+  const draft = validateDraft(input.draft);
+  if (!input.draftId || !DRAFT_ID.test(input.draftId)) throw new ExtractError("Missing draft id. Reload the page and try again.");
+  const ours = totals(draft);
+  const pp = paypal(env);
+  const key = `sent:${input.draftId}`;
+  const prev = env.LIMITS ? (JSON.parse((await env.LIMITS.get(key)) ?? "null") as SentRecord | null) : null;
+  let id = prev?.invoiceId ?? "";
+  if (!id) {
+    id = (await pp.createDraft(draft, { businessName: env.BUSINESS_NAME ?? "Paid Tonight Demo" }, `PT-${input.draftId}`)).id;
+    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: false }), { expirationTtl: 7 * 86400 });
+  }
+  if (!prev?.sent) {
+    const amount = invoiceAmount(await pp.get(id));
+    if (amount.value !== ours.total) {
+      return Response.json({ error: `PayPal computed ${amount.value} ${amount.currency}, the draft shows ${ours.total}. Nothing was sent; adjust the draft and try again.`, paypalTotal: amount.value, total: ours.total }, { status: 409 });
+    }
+    await pp.send(id, Boolean(draft.customerEmail));
+    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: true }), { expirationTtl: 7 * 86400 });
+  }
+  const [invoice, qr] = await Promise.all([pp.get(id).catch(() => null), pp.qr(id).catch(() => null)]);
+  const info = invoiceInfo(invoice);
+  return Response.json({ id, number: info.number || `PT-${input.draftId}`, href: info.href, amount: info.amount ?? { value: ours.total, currency: draft.currency },
+    qr: qr ? `data:image/png;base64,${qr}` : null, totals: ours, emailed: Boolean(draft.customerEmail), partial: !invoice || !qr });
+}
+
+function invoiceAmount(inv: unknown): { value: string; currency: string } {
+  const amount = (inv as { amount?: { value?: unknown; currency_code?: unknown } } | null)?.amount ?? {};
+  return { value: typeof amount.value === "string" ? amount.value : "", currency: typeof amount.currency_code === "string" ? amount.currency_code : "" };
+}
+
+function invoiceInfo(inv: unknown): { number: string; href: string | null; amount: { value: string; currency: string } | null } {
+  const d = (inv as { detail?: { invoice_number?: unknown; metadata?: { recipient_view_url?: unknown } } } | null)?.detail ?? {};
+  const amount = invoiceAmount(inv);
+  return {
+    number: typeof d.invoice_number === "string" ? d.invoice_number : "",
+    href: typeof d.metadata?.recipient_view_url === "string" ? d.metadata.recipient_view_url : null,
+    amount: amount.value ? amount : null,
+  };
+}
+
 const routes: Record<string, Handler> = {
   "POST /api/draft": async (req, env) => {
+    await perAddress(req, env);
     const { text } = await body<{ text?: string }>(req);
     if (typeof text !== "string" || text.trim().length < 10) throw new ExtractError("Describe the job in a sentence or two.");
     const draft = await extractDraft(text.slice(0, 2000), aiRunner(env), today());
     return Response.json({ draft, totals: totals(draft) });
   },
   "POST /api/totals": async (req) => {
-    const { draft } = await body<{ draft: InvoiceDraft }>(req);
-    return Response.json({ totals: totals(draft) });
+    const { draft } = await body<{ draft: unknown }>(req);
+    return Response.json({ totals: totals(validateDraft(draft)) });
   },
-  "POST /api/send": async (req, env) => {
-    const { draft } = await body<{ draft: InvoiceDraft }>(req);
-    const pp = paypal(env);
-    const created = await pp.createDraft(draft, { businessName: env.BUSINESS_NAME ?? "Paid Tonight Demo" });
-    await pp.send(created.id);
-    const [qr, invoice] = await Promise.all([pp.qr(created.id), pp.get(created.id)]);
-    return Response.json({ id: created.id, invoice, qr: `data:image/png;base64,${qr}`, totals: totals(draft) });
-  },
+  "POST /api/send": async (req, env) => send(req, env),
   "GET /api/unpaid": async (_req, env) => Response.json({ invoices: await paypal(env).listUnpaid() }),
   "POST /api/reminder": async (req, env) => {
+    await perAddress(req, env);
     const { id } = await body<{ id?: string }>(req);
     const inv = (await paypal(env).listUnpaid()).find((i) => i.id === id);
     if (!inv) throw new ExtractError("That invoice is not unpaid any more.");
     return Response.json({ reminder: await draftReminder(inv, aiRunner(env), today()) });
   },
   "POST /api/remind": async (req, env) => {
-    const { id, subject, note } = await body<{ id?: string; subject?: string; note?: string }>(req);
-    if (!id || !subject || !note) throw new ExtractError("Subject and note are required.");
-    await paypal(env).remind(id, subject.slice(0, 200), note.slice(0, 400));
+    const { id } = await body<{ id?: string }>(req);
+    const pp = paypal(env);
+    if (!id || !(await pp.listUnpaid()).some((i) => i.id === id)) throw new ExtractError("That invoice is not unpaid any more.");
+    await pp.remind(id);
     return Response.json({ ok: true });
   },
 };
