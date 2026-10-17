@@ -1,4 +1,4 @@
-# Paid Tonight: specification (PayPal AI Hackathon)
+# Paid Tonight specification (PayPal AI Hackathon)
 
 _Original build spec. The README describes the current version._
 
