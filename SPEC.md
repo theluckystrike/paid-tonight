@@ -1,5 +1,7 @@
 # Paid Tonight: specification (PayPal AI Hackathon)
 
+_Original build spec. The README describes the current version._
+
 A tradesperson (plumber, electrician, cleaner, tutor) finishes a job and says or types what they did:
 "Replaced the kitchen tap for Anna Kowalski, anna@example.com, 2 hours labour at 45 an hour, tap was 89.99, plus 23 percent VAT."
 Paid Tonight's agent turns this into a PayPal invoice draft (line items, tax, customer), shows it for one-tap approval,
