@@ -57,37 +57,50 @@ async function perAddress(req: Request, env: Env): Promise<void> {
 }
 
 const DRAFT_ID = /^[A-Za-z0-9]{8,16}$/;
-interface SentRecord { invoiceId: string; sent: boolean }
+interface SentRecord { invoiceId: string; sent: boolean; hash: string }
+
+/** Short content hash of the validated draft: a retry is the same invoice only if the content is the same. */
+async function draftHash(draft: InvoiceDraft): Promise<string> {
+  const { warnings: _w, ...content } = draft;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(content)));
+  return Array.from(new Uint8Array(digest).slice(0, 4), (b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+}
 
 /**
- * Create, check, send. The draft is validated first; the invoice number comes from the browser's draft id, so a
- * retry finds the same invoice instead of creating a second one; PayPal's own total must equal ours before the
- * invoice is sent; the QR code and the invoice read after sending are optional (partial success, never an error).
+ * Create, check, send. The draft is validated first. The record per draft id holds the content hash: the same content
+ * retried returns the same invoice; corrected content before sending replaces the unsent PayPal draft (new invoice
+ * number); corrected content after sending is refused, because PayPal has already emailed the customer. PayPal's own
+ * total must equal ours before sending; the QR code and the read after sending are optional (partial success).
  */
 async function send(req: Request, env: Env): Promise<Response> {
   const input = await body<{ draft: unknown; draftId?: string }>(req);
   const draft = validateDraft(input.draft);
   if (!input.draftId || !DRAFT_ID.test(input.draftId)) throw new ExtractError("Missing draft id. Reload the page and try again.");
   const ours = totals(draft);
+  const hash = await draftHash(draft);
   const pp = paypal(env);
   const key = `sent:${input.draftId}`;
   const prev = env.LIMITS ? (JSON.parse((await env.LIMITS.get(key)) ?? "null") as SentRecord | null) : null;
-  let id = prev?.invoiceId ?? "";
-  if (!id) {
-    id = (await pp.createDraft(draft, { businessName: env.BUSINESS_NAME ?? "Paid Tonight Demo" }, `PT-${input.draftId}`)).id;
-    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: false }), { expirationTtl: 7 * 86400 });
+  if (prev?.sent && prev.hash !== hash) {
+    return Response.json({ error: "This invoice was already sent with the earlier details. Use \"Make another\" for a corrected invoice." }, { status: 409 });
   }
-  if (!prev?.sent) {
+  let id = prev && prev.hash === hash ? prev.invoiceId : "";
+  if (prev && !prev.sent && prev.hash !== hash) await pp.deleteDraft(prev.invoiceId).catch(() => undefined); // unsent draft with old details
+  if (!id) {
+    id = (await pp.createDraft(draft, { businessName: env.BUSINESS_NAME ?? "Paid Tonight Demo" }, `PT-${input.draftId}-${hash.slice(0, 6)}`)).id;
+    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: false, hash }), { expirationTtl: 7 * 86400 });
+  }
+  if (!(prev?.sent && prev.hash === hash)) {
     const amount = invoiceAmount(await pp.get(id));
     if (amount.value !== ours.total) {
       return Response.json({ error: `PayPal computed ${amount.value} ${amount.currency}, the draft shows ${ours.total}. Nothing was sent; adjust the draft and try again.`, paypalTotal: amount.value, total: ours.total }, { status: 409 });
     }
     await pp.send(id, Boolean(draft.customerEmail));
-    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: true }), { expirationTtl: 7 * 86400 });
+    await env.LIMITS?.put(key, JSON.stringify({ invoiceId: id, sent: true, hash }), { expirationTtl: 7 * 86400 });
   }
   const [invoice, qr] = await Promise.all([pp.get(id).catch(() => null), pp.qr(id).catch(() => null)]);
   const info = invoiceInfo(invoice);
-  return Response.json({ id, number: info.number || `PT-${input.draftId}`, href: info.href, amount: info.amount ?? { value: ours.total, currency: draft.currency },
+  return Response.json({ id, number: info.number || `PT-${input.draftId}-${hash.slice(0, 6)}`, href: info.href, amount: info.amount ?? { value: ours.total, currency: draft.currency },
     qr: qr ? `data:image/png;base64,${qr}` : null, totals: ours, emailed: Boolean(draft.customerEmail), partial: !invoice || !qr });
 }
 

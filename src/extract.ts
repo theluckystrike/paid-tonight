@@ -174,16 +174,21 @@ function normalizeUnit(unit: string | null | undefined): LineItem["unit"] {
 
 export const SUPPORTED = ["USD", "EUR", "GBP", "PLN", "CAD", "AUD"];
 
-/** Currencies named in the text, as ISO codes. "$" alone is ambiguous and ignored. */
-const CURRENCY_WORDS: Array<[RegExp, string]> = [
-  [/\b(yen|jpy)\b|¥/i, "JPY"], [/\b(forints?|huf)\b/i, "HUF"], [/\b(swiss francs?|chf)\b/i, "CHF"],
-  [/\b(twd)\b|nt\$/i, "TWD"], [/\b(sek|nok|dkk|kronor|kroner)\b/i, "SEK"], [/\b(euros?|eur)\b|€/i, "EUR"],
-  [/\b(gbp|quid|pounds? sterling)\b|£/i, "GBP"], [/\b(zlotys?|złotych|złoty|zł|pln)\b/i, "PLN"], [/\b(cad|canadian dollars?)\b/i, "CAD"],
-  [/\b(aud|australian dollars?)\b/i, "AUD"],
+/**
+ * Currencies named next to an amount ("50 euro", "€30", "3000 yen"), as ISO codes. A currency word on its own is not
+ * enough: "euro cylinder lock", "CAD drawings" or a customer called Yen must not change the invoice. "$" alone is ambiguous.
+ */
+const CURRENCY_WORDS: Array<[string, string]> = [
+  ["yen|jpy|¥", "JPY"], ["forints?|huf", "HUF"], ["swiss francs?|chf", "CHF"], ["twd|nt\\$", "TWD"], ["sek|nok|dkk|kronor|kroner", "SEK"],
+  ["euros?|eur|€", "EUR"], ["gbp|quid|pounds? sterling|£", "GBP"], ["zlotys?|złotych|złoty|zł|pln", "PLN"], ["cad|canadian dollars?", "CAD"],
+  ["aud|australian dollars?", "AUD"],
 ];
+const AMOUNT = "\\d[\\d.,]*";
+const NAMED: Array<[RegExp, string]> = CURRENCY_WORDS.map(([w, code]) =>
+  [new RegExp(`(?:${AMOUNT}\\s*(?:${w})(?![\\p{L}\\p{N}]))|(?:(?<![\\p{L}\\p{N}])(?:${w})\\s*${AMOUNT})`, "iu"), code]);
 
 function namedCurrency(text: string): string | null {
-  for (const [re, code] of CURRENCY_WORDS) if (re.test(text)) return code;
+  for (const [re, code] of NAMED) if (re.test(text)) return code;
   return null;
 }
 
@@ -226,7 +231,9 @@ function cents(items: LineItem[]): bigint {
   return total;
 }
 
-const DISCOUNT_NAME = /\b(discount|rebate|refund|credit|money off|reduction)\b/i;
+// Only words that can only mean a discount: "pressure reduction valve" or "credit card reader" are real items.
+const DISCOUNT_NAME = /\b(discount|rebate)\b/i;
+const PERCENT_OFF = /(\d+(?:\.\d+)?)\s*(?:%|percent|per cent)\s*(?:off|discount)\b|\b(?:discount|off)\s*(?:of\s*)?(\d+(?:\.\d+)?)\s*(?:%|percent|per cent)/i;
 
 function normalize(raw: RawDraft, text: string): InvoiceDraft {
   const warnings: string[] = [];
@@ -246,6 +253,15 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
   if (items.length === 0) throw new ExtractError("The description has no billable items.");
   const subtotal = cents(items);
   if (subtotal >= TOTAL_BLOCK_CENTS) throw new ExtractError("The total is above 100,000. Check the amounts and try again.");
+  // "10 percent off" is a share of the work, not 10 in money: compute it from the subtotal in code.
+  const pct = PERCENT_OFF.exec(text);
+  if (pct) {
+    const bps = scaleRound(pct[1] ?? pct[2] ?? "0", 2) ?? 0n;
+    if (bps > 0n && bps <= 10000n) {
+      discountCents = (subtotal * bps + 5000n) / 10000n;
+      warnings.push(`Discount of ${formatPercent(pct[1] ?? pct[2] ?? "0")}% applied: ${formatMoney(discountCents)}`);
+    }
+  }
   if (discountCents > subtotal) throw new ExtractError("The discount is larger than the work billed.");
   if (discountCents === 0n && /\b(discount|knock(ed)? off|minus|less|\d+\s*(%|percent)?\s*off)\b/i.test(text)) warnings.push("Discount mentioned but not applied");
   const customerName = (raw.customerName ?? "").trim() || "Customer";

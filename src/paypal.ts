@@ -80,6 +80,11 @@ export class PayPal {
     return extractQrBase64(await res.text());
   }
 
+  /** Delete an invoice that is still a draft (never sent). */
+  async deleteDraft(id: string): Promise<void> {
+    await this.request("DELETE", `/v2/invoicing/invoices/${encodeURIComponent(id)}`);
+  }
+
   async get(id: string): Promise<unknown> {
     const res = await this.request("GET", `/v2/invoicing/invoices/${encodeURIComponent(id)}`);
     return res.json();

@@ -214,3 +214,22 @@ test("includes the description and date in the prompt", async () => {
   assert.match(joined, /2026-10-17/);
   assert.match(joined, /NEVER compute or return any totals/);
 });
+
+test("R6: currency words count only next to an amount", async () => {
+  const usd = { currency: "USD", items: [{ name: "Labour", quantity: "2", unitAmount: "50", unit: "HOURS" }] };
+  for (const text of ["Fitted a euro cylinder lock for Tom", "Fixed sink for Yen Nguyen", "Printed CAD drawings for Anna", "Naprawa złamanej rury"]) {
+    const d = await extractDraft(text + ", 2 hours at 50", aiOnce(draftJson(usd)), TODAY);
+    assert.equal(d.currency, "USD", text);
+  }
+  assert.equal((await extractDraft("2 hours at 50 euro an hour", aiOnce(draftJson(usd)), TODAY)).currency, "EUR");
+});
+
+test("R6: an item with 'reduction' in its name is an item, and '10 percent off' is a percentage", async () => {
+  const valve = await extractDraft("Fitted a pressure reduction valve 95 and 2 hours labour at 25", aiOnce(draftJson({ items: [
+    { name: "Pressure reduction valve", quantity: "1", unitAmount: "95" }, { name: "Labour", quantity: "2", unitAmount: "25", unit: "HOURS" }] })), TODAY);
+  assert.equal(valve.items.length, 2);
+  assert.equal(valve.discount, undefined);
+  const pct = await extractDraft("2 hours at 50, valve 30, 10 percent off", aiOnce(draftJson({ discount: "10", items: [
+    { name: "Labour", quantity: "2", unitAmount: "50", unit: "HOURS" }, { name: "Valve", quantity: "1", unitAmount: "30" }] })), TODAY);
+  assert.equal(pct.discount, "13.00");
+});

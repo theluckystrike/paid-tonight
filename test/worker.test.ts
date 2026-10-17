@@ -63,10 +63,10 @@ test("send: invoice number from the draft id, request id header, and a retry nei
   const env = envWith(pp);
   const first = await call(env, "/api/send", { draft, draftId: "ABCDEFGH12" });
   assert.equal(first.status, 200);
-  assert.equal(first.body.number, "PT-ABCDEFGH12");
+  assert.match(String(first.body.number), /^PT-ABCDEFGH12-[0-9A-F]{6}$/);
   assert.match(String(first.body.href), /sandbox\.paypal\.com/);
   const create = pp.calls.find((c) => c.path === "/v2/invoicing/invoices" && c.method === "POST")!;
-  assert.equal(create.headers["PayPal-Request-Id"], "PT-ABCDEFGH12");
+  assert.equal(create.headers["PayPal-Request-Id"], first.body.number);
   const again = await call(env, "/api/send", { draft, draftId: "ABCDEFGH12" });
   assert.equal(again.status, 200);
   assert.equal(pp.calls.filter((c) => c.path === "/v2/invoicing/invoices" && c.method === "POST").length, 1);
@@ -108,4 +108,23 @@ test("remind: only an unpaid invoice can be reminded, and no custom text is sent
   const r = await call(env, "/api/remind", { id: "INV2-999" });
   assert.equal(r.status, 422);
   assert.ok(!pp.calls.some((c) => c.path.endsWith("/remind")));
+});
+
+test("N1: a corrected draft is never sent as the old invoice", async () => {
+  const pp = fakePayPal({ totalOverride: "106.41" });
+  const env = envWith(pp);
+  // First try fails at the total check (PayPal disagrees), so nothing is sent.
+  const bad = fakePayPal({ totalOverride: "1.00" });
+  globalThis.fetch = bad.fetchFn;
+  const r1 = await call(env, "/api/send", { draft: { ...draft, customerEmail: "olla@exmaple.com" }, draftId: "FIXEMAIL12" });
+  assert.equal(r1.status, 409);
+  globalThis.fetch = pp.fetchFn;
+  const r2 = await call(env, "/api/send", { draft, draftId: "FIXEMAIL12" });
+  assert.equal(r2.status, 200);
+  const sentCreate = pp.calls.find((c) => c.path === "/v2/invoicing/invoices" && c.method === "POST")!;
+  assert.equal((sentCreate.body as { primary_recipients: Array<{ billing_info: { email_address: string } }> }).primary_recipients[0]!.billing_info.email_address, "ola@example.com");
+  // After sending, a changed draft under the same id is refused.
+  const r3 = await call(env, "/api/send", { draft: { ...draft, note: "changed" }, draftId: "FIXEMAIL12" });
+  assert.equal(r3.status, 409);
+  assert.equal(pp.calls.filter((c) => c.path.endsWith("/send")).length, 1);
 });
