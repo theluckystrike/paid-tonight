@@ -185,9 +185,24 @@ function normalizeUnpaid(raw) {
   };
 }
 
-async function request(path, options, fetchFn) {
+// Optional access code for the PayPal actions, asked once and kept for this browser tab only.
+function accessCode() {
+  try { return sessionStorage.getItem("pt-code") || ""; } catch (err) { return ""; }
+}
+
+async function request(path, options, fetchFn, retried) {
   const fn = typeof fetchFn === "function" ? fetchFn : globalThis.fetch;
-  const res = await fn(path, options);
+  const opts = Object.assign({}, options || {});
+  const code = accessCode();
+  if (code) opts.headers = Object.assign({}, opts.headers || {}, { "x-demo-code": code });
+  const res = await fn(path, opts);
+  if (res.status === 401 && !retried && typeof window !== "undefined" && typeof window.prompt === "function") {
+    const entered = window.prompt("This demo asks for an access code before it talks to PayPal.");
+    if (entered) {
+      try { sessionStorage.setItem("pt-code", entered.trim()); } catch (err) { /* private mode: the code is used for this request only */ }
+      return request(path, Object.assign({}, options, { headers: Object.assign({}, (options || {}).headers || {}, { "x-demo-code": entered.trim() }) }), fetchFn, true);
+    }
+  }
   const body = await res.text();
   let data = null;
   if (body) {

@@ -128,3 +128,15 @@ test("N1: a corrected draft is never sent as the old invoice", async () => {
   assert.equal(r3.status, 409);
   assert.equal(pp.calls.filter((c) => c.path.endsWith("/send")).length, 1);
 });
+
+test("H5: with DEMO_SEND_CODE set, PayPal routes need the code; drafting does not", async () => {
+  const pp = fakePayPal({ totalOverride: "106.41" });
+  const env = { ...envWith(pp), DEMO_SEND_CODE: "s3cret-code" };
+  const no = await call(env, "/api/send", { draft, draftId: "CODECHECK1" });
+  assert.equal(no.status, 401);
+  assert.equal(pp.calls.length, 0);
+  const res = await worker.fetch(new Request("http://x/api/send", { method: "POST", headers: { "content-type": "application/json", "x-demo-code": "s3cret-code" }, body: JSON.stringify({ draft, draftId: "CODECHECK1" }) }), env as never);
+  assert.equal(res.status, 200);
+  const totalsRes = await call(env, "/api/totals", { draft });
+  assert.equal(totalsRes.status, 200);
+});

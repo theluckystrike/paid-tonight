@@ -14,6 +14,8 @@ interface Env {
   PAYPAL_CLIENT_SECRET?: string;
   BUSINESS_NAME?: string;
   AI_LIMIT?: { limit(o: { key: string }): Promise<{ success: boolean }> };
+  /** Optional: when set, the PayPal routes (send, unpaid, reminder, remind) need this code in the x-demo-code header. */
+  DEMO_SEND_CODE?: string;
 }
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -54,6 +56,16 @@ async function body<T>(request: Request): Promise<T> {
 }
 
 type Handler = (request: Request, env: Env) => Promise<Response>;
+
+const GUARDED = new Set(["POST /api/send", "GET /api/unpaid", "POST /api/reminder", "POST /api/remind"]);
+
+/** Constant-time comparison of the access code. */
+function sameCode(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 /** Per-address brake on AI calls, so one visitor cannot use up the shared daily cap. */
 async function perAddress(req: Request, env: Env): Promise<void> {
@@ -157,7 +169,11 @@ const routes: Record<string, Handler> = {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
-    const handler = routes[`${request.method} ${pathname}`];
+    const routeKey = `${request.method} ${pathname}`;
+    const handler = routes[routeKey];
+    if (handler && env.DEMO_SEND_CODE && GUARDED.has(routeKey) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
+      return Response.json({ error: "This action needs the access code.", needCode: true }, { status: 401 });
+    }
     if (!handler) return pathname.startsWith("/api/") ? Response.json({ error: "Not found." }, { status: 404 }) : env.ASSETS.fetch(request);
     try { return await handler(request, env); } catch (err) { return fail(err); }
   },
