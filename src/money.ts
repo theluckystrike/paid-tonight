@@ -5,7 +5,7 @@ export interface PayPalItem {
   quantity: string;
   unit_amount: { currency_code: string; value: string };
   unit_of_measure: string;
-  tax: { name: string; percent: string };
+  tax?: { name: string; percent: string };
 }
 
 const DECIMAL_RE = /^\d+(\.\d+)?$/;
@@ -60,12 +60,15 @@ export function totals(draft: InvoiceDraft): Totals {
 }
 
 export function toPayPalItems(draft: InvoiceDraft): PayPalItem[] {
-  const percent = draft.taxPercent ?? "0";
-  return draft.items.map((item) => ({
-    name: item.name,
-    quantity: item.quantity,
-    unit_amount: { currency_code: draft.currency, value: item.unitAmount },
-    unit_of_measure: item.unit ?? "QUANTITY",
-    tax: { name: "Tax", percent },
-  }));
+  // No tax given: no tax object at all, so the PayPal invoice shows no "Tax 0%" line.
+  return draft.items.map((item) => {
+    const out: PayPalItem = {
+      name: item.name,
+      quantity: item.quantity,
+      unit_amount: { currency_code: draft.currency, value: item.unitAmount },
+      unit_of_measure: item.unit ?? "QUANTITY",
+    };
+    if (draft.taxPercent != null) out.tax = { name: "Tax", percent: draft.taxPercent };
+    return out;
+  });
 }

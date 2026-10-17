@@ -57,7 +57,7 @@ The public demo has a daily cap of 60 AI calls so it stays inside the free allow
 - The AI never computes money. Totals come from integer cents in code.
 - Nothing is sent to a customer without your tap on "Send" or "Send PayPal reminder".
 - The API accepts only `application/json`, so another website cannot post forms to it through your browser.
-- Secrets live in Worker secrets, never in the code or the browser, and text from the server is rendered with `textContent`, never as HTML.
+- Secrets live in Worker secrets, never in the code or the browser. Text from the server is rendered with `textContent`, never as HTML, and pages are served with a strict Content Security Policy (no inline script) and framing denied.
 
 ## Status
 
@@ -70,7 +70,7 @@ npm install
 npx wrangler secret put PAYPAL_CLIENT_ID      # sandbox app from developer.paypal.com
 npx wrangler secret put PAYPAL_CLIENT_SECRET
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 75 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 78 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License

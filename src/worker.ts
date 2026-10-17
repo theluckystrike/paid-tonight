@@ -27,9 +27,13 @@ function aiRunner(env: Env): AiRunner {
   };
 }
 
+// One client per isolate, so the OAuth token cache survives across requests.
+let cached: { key: string; client: PayPal } | null = null;
 function paypal(env: Env): PayPal {
   if (!env.PAYPAL_CLIENT_ID || !env.PAYPAL_CLIENT_SECRET) throw new PayPalError(503, "PayPal sandbox credentials are not configured on this server.");
-  return new PayPal(env.PAYPAL_CLIENT_ID, env.PAYPAL_CLIENT_SECRET);
+  const key = env.PAYPAL_CLIENT_ID;
+  if (!cached || cached.key !== key) cached = { key, client: new PayPal(env.PAYPAL_CLIENT_ID, env.PAYPAL_CLIENT_SECRET) };
+  return cached.client;
 }
 
 function fail(err: unknown): Response {
@@ -43,6 +47,7 @@ async function body<T>(request: Request): Promise<T> {
   // JSON only (parsed MIME type): a cross-site form or text/plain post cannot reach PayPal through this server.
   const essence = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
   if (essence !== "application/json") throw new ExtractError("Send JSON with content-type application/json.");
+  if (Number(request.headers.get("content-length") ?? "0") > 20_000) throw new ExtractError("The request is too large.");
   const text = await request.text();
   if (text.length > 20_000) throw new ExtractError("The request is too large.");
   try { return JSON.parse(text) as T; } catch { throw new ExtractError("Send JSON."); }

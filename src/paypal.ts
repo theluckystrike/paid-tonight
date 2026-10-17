@@ -18,7 +18,8 @@ export class PayPal {
   constructor(clientId: string, secret: string, fetchFn?: typeof fetch, base?: string) {
     this.clientId = clientId;
     this.secret = secret;
-    this.fetchFn = fetchFn ?? globalThis.fetch.bind(globalThis);
+    // Looked up per call, so a long-lived client always uses the current global fetch.
+    this.fetchFn = fetchFn ?? ((input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init));
     this.base = (base ?? DEFAULT_BASE).replace(/\/+$/, "");
   }
 
@@ -112,11 +113,20 @@ export class PayPal {
   }
 
   private async request(method: string, path: string, opts: { body?: string; contentType?: string; requestId?: string } = {}): Promise<Response> {
-    const token = await this.token();
-    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-    if (opts.contentType) headers["Content-Type"] = opts.contentType;
-    if (opts.requestId) headers["PayPal-Request-Id"] = opts.requestId;
-    return this.rawRequest(method, path, { headers, body: opts.body });
+    const build = async () => {
+      const headers: Record<string, string> = { Authorization: `Bearer ${await this.token()}` };
+      if (opts.contentType) headers["Content-Type"] = opts.contentType;
+      if (opts.requestId) headers["PayPal-Request-Id"] = opts.requestId;
+      return headers;
+    };
+    try {
+      return await this.rawRequest(method, path, { headers: await build(), body: opts.body });
+    } catch (err) {
+      // An expired or revoked token: drop it and retry once with a fresh one.
+      if (!(err instanceof PayPalError) || err.status !== 401) throw err;
+      this.tokenValue = null;
+      return this.rawRequest(method, path, { headers: await build(), body: opts.body });
+    }
   }
 
   private async rawRequest(method: string, path: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
@@ -142,11 +152,13 @@ export class PayPal {
     if (body && typeof body === "object") {
       const b = body as { debug_id?: unknown; message?: unknown; name?: unknown; details?: unknown };
       if (typeof b.debug_id === "string") debugId = b.debug_id;
+      // Every detail, with a readable field name: "Customer email: Invalid email address; Item 2 price: ..."
       const details = Array.isArray(b.details) ? b.details : [];
-      const first = details[0];
-      if (first && typeof first === "object" && typeof (first as { description?: unknown }).description === "string") {
-        message = (first as { description?: unknown }).description as string;
-      }
+      message = details
+        .map((d) => (d && typeof d === "object" ? d as { field?: unknown; description?: unknown } : {}))
+        .filter((d) => typeof d.description === "string")
+        .map((d) => (typeof d.field === "string" && d.field ? `${fieldLabel(d.field)}: ` : "") + String(d.description))
+        .join("; ");
       if (!message && typeof b.message === "string") message = b.message;
       if (!message && typeof b.name === "string") message = b.name;
     }
@@ -217,4 +229,14 @@ function dueDateOf(detail: Record<string, unknown>): string | null {
   if (typeof term.due_date === "string") return term.due_date;
   if (typeof detail.due_date === "string") return detail.due_date;
   return typeof detail.invoice_date === "string" ? detail.invoice_date : null;
+}
+
+function fieldLabel(pointer: string): string {
+  const p = pointer.replace(/^\//, "");
+  if (/billing_info\/email_address/.test(p)) return "Customer email";
+  if (/billing_info\/name/.test(p)) return "Customer name";
+  const item = /^items\/(\d+)\/(\w+)/.exec(p);
+  if (item) return `Item ${Number(item[1]) + 1} ${item[2] === "unit_amount" ? "price" : item[2]}`;
+  if (/invoice_number/.test(p)) return "Invoice number";
+  return p.replace(/\//g, " ").replace(/_/g, " ");
 }

@@ -76,11 +76,11 @@ test("toPayPalItems: maps fields and defaults unit to QUANTITY", () => {
   }]);
 });
 
-test("toPayPalItems: null tax percent becomes zero and unit passes through", () => {
+test("toPayPalItems: null tax percent sends no tax object, and unit passes through", () => {
   const items = toPayPalItems(draft({
     items: [{ name: "Tap", quantity: "1", unitAmount: "89.99", unit: "HOURS" }],
   }));
-  assert.equal(items[0]?.tax.percent, "0");
+  assert.equal(items[0]?.tax, undefined);
   assert.equal(items[0]?.unit_of_measure, "HOURS");
 });
 

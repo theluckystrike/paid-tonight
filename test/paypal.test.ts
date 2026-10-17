@@ -273,7 +273,7 @@ test("non-2xx throws PayPalError with details description and debug_id", async (
   await assert.rejects(() => pp.get("INV-1"), (err: unknown) => {
     assert.ok(err instanceof PayPalError);
     assert.equal((err as PayPalError).status, 400);
-    assert.equal((err as PayPalError).message, "Detailed description");
+    assert.equal((err as PayPalError).message, "x: Detailed description");
     assert.equal((err as PayPalError).debugId, "abc-123");
     return true;
   });
@@ -301,4 +301,31 @@ test("network failure throws PayPalError with status 0", async () => {
     assert.equal((err as PayPalError).message, "boom");
     return true;
   });
+});
+
+test("L2: every PayPal validation detail is shown with a readable field name", async () => {
+  const { fetch } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse()
+      : json({ name: "UNPROCESSABLE_ENTITY", details: [{ field: "/primary_recipients/0/billing_info/email_address", description: "Invalid email address." }, { field: "/items/1/unit_amount/value", description: "Must be positive." }] }, 422));
+  const pp = new PayPal("cid", "sec", fetch);
+  await assert.rejects(pp.get("INV-1"), (e: Error) => /Customer email: Invalid email address\. ; Item 2 price: Must be positive\./.test(e.message.replace(";", " ;")));
+});
+
+test("L1: a 401 drops the token and retries once with a fresh one", async () => {
+  let tokens = 0, gets = 0;
+  const { fetch } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") { tokens++; return tokenResponse(); }
+    gets++;
+    return gets === 1 ? json({ name: "AUTHENTICATION_FAILURE" }, 401) : json({ id: "INV-1" });
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.get("INV-1");
+  assert.equal(tokens, 2);
+  assert.equal(gets, 2);
+});
+
+test("L4: no tax given means no tax object on PayPal items", async () => {
+  const { toPayPalItems } = await import("../src/money.js");
+  const items = toPayPalItems({ customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], items: [{ name: "x", quantity: "1", unitAmount: "5.00" }] });
+  assert.equal("tax" in items[0]!, false);
 });
