@@ -75,16 +75,23 @@ function centsToStr(cents) {
   return `${neg ? "-" : ""}${whole}.${frac.toString().padStart(2, "0")}`;
 }
 
+// String decimals, rounded half up like the server: no float rounding (1.005 is 1.01) and no exponent notation.
+function roundDecimal(value, places) {
+  const text = String(value == null ? "" : value).trim();
+  if (!/^\d{1,9}(\.\d+)?$/.test(text)) return null;
+  const p = parseDecimal(text);
+  const scaled = roundHalfUp(p.coeff * (10n ** BigInt(places)), 10n ** BigInt(p.scale));
+  const s = scaled.toString().padStart(places + 1, "0");
+  return places ? s.slice(0, -places) + "." + s.slice(-places) : s;
+}
+
 function decimalText(value, fallback) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return n.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+  const r = roundDecimal(value, 3);
+  return r == null ? fallback : r.replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function moneyText(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "0.00";
-  return n.toFixed(2);
+  return roundDecimal(value, 2) ?? "0.00";
 }
 
 function formatMoney(amount, currency) {
@@ -553,7 +560,7 @@ function showSuccess(ui, result) {
 
   const againBtn = el("button", "btn btn--primary", "Make another");
   againBtn.type = "button";
-  againBtn.addEventListener("click", () => { ui.success.replaceChildren(); ui.success.hidden = true; state.draftId = null; });
+  againBtn.addEventListener("click", () => { ui.success.replaceChildren(); ui.success.hidden = true; state.draftId = null; ui.jobText.value = ""; ui.jobText.focus(); });
   card.append(againBtn);
 
   ui.success.replaceChildren(card);
