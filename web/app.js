@@ -332,6 +332,7 @@ function renderTotals(box, warningsBox) {
   const totals = state.totals || computeTotals(state.draft);
   box.replaceChildren();
   box.append(totalsLine("Subtotal", totals.subtotal, false));
+  if (totals.discount && totals.discount !== "0.00") box.append(totalsLine("Discount", "-" + totals.discount, false));
   box.append(totalsLine("Tax", totals.tax, false));
   box.append(totalsLine("Total", totals.total, true));
   const warnings = dedupeWarnings(state.draft.warnings || [], computeWarnings(state.draft));
