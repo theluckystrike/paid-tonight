@@ -1,0 +1,28 @@
+{
+  "name": "paid-tonight",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "tsx --test test/*.test.ts",
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "wrangler": "4.151.1"
+  }
+}

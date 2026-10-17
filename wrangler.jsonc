@@ -1,0 +1,11 @@
+{
+  "name": "paid-tonight",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": { "directory": "./web", "binding": "ASSETS" },
+  "ai": { "binding": "AI" },
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "limits": { "cpu_ms": 100 }
+}

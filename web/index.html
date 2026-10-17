@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1b3a6b">
+  <meta name="color-scheme" content="light">
+  <title>Paid Tonight</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-header__inner">
+      <h1 class="app-title">Paid Tonight</h1>
+      <p class="app-subtitle">Turn a job into a PayPal invoice in one tap.</p>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab" id="tab-new" role="tab" aria-selected="true" aria-controls="panel-new">New invoice</button>
+    <button class="tab" id="tab-unpaid" role="tab" aria-selected="false" aria-controls="panel-unpaid" tabindex="-1">Unpaid</button>
+  </nav>
+
+  <main class="app-main">
+    <section id="panel-new" class="panel" role="tabpanel" aria-labelledby="tab-new">
+      <label class="field-label" for="job-text">What did you do?</label>
+      <div class="voice-wrap">
+        <textarea id="job-text" class="job-text" rows="5"
+          placeholder="Describe the job, the customer, and the price. Example: replaced a kitchen tap for Anna Kowalski, anna@example.com, 2 hours at 45 an hour, tap was 89.99, plus 23 percent VAT."></textarea>
+        <button id="mic-btn" class="mic-btn" type="button" aria-label="Speak the job description">
+          <svg class="mic-btn__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+            <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+          </svg>
+        </button>
+      </div>
+      <div class="chips" aria-label="Example descriptions">
+        <button type="button" class="chip" data-example="plumber">Plumber job</button>
+        <button type="button" class="chip" data-example="electrician">Electrician job</button>
+        <button type="button" class="chip" data-example="cleaner">Cleaner job</button>
+      </div>
+      <button id="make-btn" class="btn btn--primary" type="button">Make invoice</button>
+      <p id="new-error" class="error" role="alert" hidden></p>
+
+      <div id="preview" class="card" hidden></div>
+      <div id="success" class="card card--success" hidden></div>
+    </section>
+
+    <section id="panel-unpaid" class="panel" role="tabpanel" aria-labelledby="tab-unpaid" hidden>
+      <p class="section-note">Invoices you have sent but not yet been paid.</p>
+      <p id="unpaid-error" class="error" role="alert" hidden></p>
+      <div id="unpaid-list" class="unpaid-list"></div>
+      <div id="reminder-editor" class="card" hidden></div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <p>Sandbox demo. No real money moves.</p>
+    <p>Paid Tonight by Michael Lip, <a href="https://github.com/theluckystrike" target="_blank" rel="noopener">github.com/theluckystrike</a>.</p>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
