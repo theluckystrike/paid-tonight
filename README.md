@@ -1,5 +1,7 @@
 # Paid Tonight
 
+<img src="docs/cover.jpg" alt="Paid Tonight" width="800">
+
 Finish the job, say what you did, and get paid before you leave. Paid Tonight turns a plain description of a job into a PayPal invoice with line items, discount, tax and a QR code the customer can scan on the spot. A second agent watches unpaid invoices: it sends PayPal's standard reminder when you tap it, and drafts a personal message you can send by email in your own words. Built by Michael Lip, [github.com/theluckystrike](https://github.com/theluckystrike), for the PayPal AI Hackathon.
 
 > "Replaced the kitchen tap for Anna Kowalski, anna@example.com, 2 hours labour at 45 an hour, tap was 89.99, plus 23 percent VAT."
