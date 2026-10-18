@@ -44,7 +44,11 @@ export class PayPal {
     // A fixed invoice number per draft: PayPal refuses a second invoice with the same number, so a retry cannot duplicate.
     if (invoiceNumber) detail.invoice_number = invoiceNumber;
     if (draft.note != null) detail.note = draft.note;
-    const billing: Record<string, unknown> = { name: { full_name: draft.customerName } };
+    // The sandbox keeps given_name and surname but drops a lone full_name, so send both forms.
+    const parts = draft.customerName.trim().split(/\s+/);
+    const name: Record<string, string> = { full_name: draft.customerName, given_name: parts[0] ?? "" };
+    if (parts.length > 1) name.surname = parts.slice(1).join(" ");
+    const billing: Record<string, unknown> = { name };
     if (draft.customerEmail != null) billing.email_address = draft.customerEmail;
     const payload: Record<string, unknown> = {
       detail,

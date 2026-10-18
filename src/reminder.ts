@@ -28,7 +28,9 @@ function daysOverdue(dueDate: string | null, today: string): number {
   const due = Date.parse(dueDate.slice(0, 10) + "T00:00:00Z");
   const now = Date.parse(today.slice(0, 10) + "T00:00:00Z");
   if (Number.isNaN(due) || Number.isNaN(now)) return 0;
-  return Math.floor((now - due) / DAY_MS);
+  // PayPal sets the due date in the seller's time zone (often US time), so a day of grace keeps an invoice sent today
+  // from reading as overdue in UTC. It counts as overdue only once its due date has ended everywhere.
+  return Math.max(0, Math.floor((now - due) / DAY_MS) - 1);
 }
 
 function computeTone(days: number): "friendly" | "firm" {

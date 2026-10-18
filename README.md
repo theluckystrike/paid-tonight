@@ -61,7 +61,7 @@ The public demo has a daily cap of 60 AI calls so it stays inside the free allow
 
 ## Status
 
-The AI extraction, money rules and the whole send flow are live and tested against a fake PayPal that follows the Invoicing v2 API. The live sandbox run (create, send, QR, remind) is the next step and needs a PayPal developer account sign-in.
+The AI extraction, money rules and the whole send flow are live and connected to the PayPal sandbox. A live sandbox run created and sent an invoice for 146.90 EUR, returned the QR code and pay link, returned the same invoice on a retry, listed it as unpaid and sent a PayPal reminder. The tests use a fake PayPal that follows the Invoicing v2 API.
 
 ## Run it
 
@@ -71,7 +71,7 @@ npx wrangler secret put PAYPAL_CLIENT_ID      # sandbox app from developer.paypa
 npx wrangler secret put PAYPAL_CLIENT_SECRET
 npx wrangler secret put DEMO_SEND_CODE        # optional: an access code for send, unpaid and reminders
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 81 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 82 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License

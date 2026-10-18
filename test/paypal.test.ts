@@ -105,7 +105,7 @@ test("createDraft: builds the invoice payload with email", async () => {
   assert.deepEqual(JSON.parse(create.body ?? "{}"), {
     detail: { currency_code: "USD", note: "Kitchen tap", payment_term: { term_type: "DUE_ON_RECEIPT" } },
     invoicer: { business_name: "ACME Plumbing" },
-    primary_recipients: [{ billing_info: { name: { full_name: "Anna Kowalski" }, email_address: "anna@example.com" } }],
+    primary_recipients: [{ billing_info: { name: { full_name: "Anna Kowalski", given_name: "Anna", surname: "Kowalski" }, email_address: "anna@example.com" } }],
     items: [
       { name: "Labour", quantity: "2", unit_amount: { currency_code: "USD", value: "45.00" }, unit_of_measure: "HOURS", tax: { name: "Tax", percent: "23" } },
       { name: "Tap", quantity: "1", unit_amount: { currency_code: "USD", value: "89.99" }, unit_of_measure: "AMOUNT", tax: { name: "Tax", percent: "23" } },
@@ -127,7 +127,7 @@ test("createDraft: omits email_address and note when null", async () => {
   assert.ok(create);
   const body = JSON.parse(create.body ?? "{}");
   assert.deepEqual(body.detail, { currency_code: "USD", payment_term: { term_type: "DUE_ON_RECEIPT" } });
-  assert.deepEqual(body.primary_recipients, [{ billing_info: { name: { full_name: "Anna Kowalski" } } }]);
+  assert.deepEqual(body.primary_recipients, [{ billing_info: { name: { full_name: "Anna Kowalski", given_name: "Anna", surname: "Kowalski" } } }]);
 });
 
 test("createDraft: derives id from href when id is absent", async () => {

@@ -112,7 +112,8 @@ function daysOverdue(invoice, today) {
   if (Number.isNaN(due)) return null;
   const ref = today ? Date.parse(String(today)) : Date.now();
   const base = Number.isNaN(ref) ? Date.now() : ref;
-  return Math.max(0, Math.floor((base - due) / 86400000));
+  // Same rule as the server: one day of grace, because PayPal sets the due date in the seller's time zone.
+  return Math.max(0, Math.floor((base - due) / 86400000) - 1);
 }
 
 function qrDataUrl(qr) {

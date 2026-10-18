@@ -41,17 +41,17 @@ test("not due gives friendly tone", async () => {
 });
 
 test("one day overdue gives friendly tone", async () => {
-  const r = await draftReminder(invoice({ dueDate: "2026-10-16" }), aiOnce(good), TODAY);
+  const r = await draftReminder(invoice({ dueDate: "2026-10-15" }), aiOnce(good), TODAY);
   assert.equal(r.tone, "friendly");
 });
 
 test("fourteen days overdue gives friendly tone", async () => {
-  const r = await draftReminder(invoice({ dueDate: "2026-10-03" }), aiOnce(good), TODAY);
+  const r = await draftReminder(invoice({ dueDate: "2026-10-02" }), aiOnce(good), TODAY);
   assert.equal(r.tone, "friendly");
 });
 
 test("fifteen days overdue gives firm tone", async () => {
-  const r = await draftReminder(invoice({ dueDate: "2026-10-02" }), aiOnce(good), TODAY);
+  const r = await draftReminder(invoice({ dueDate: "2026-10-01" }), aiOnce(good), TODAY);
   assert.equal(r.tone, "firm");
 });
 
@@ -107,4 +107,10 @@ test("prompt names the customer, invoice number, amount and tone", async () => {
   assert.match(content, /INV-0042/);
   assert.match(content, /179\.99 USD/);
   assert.match(content, /firm/);
+});
+
+test("an invoice due yesterday in UTC is not called overdue (PayPal dates follow the seller's time zone)", async () => {
+  const { ai, calls } = aiCapturing(good);
+  await draftReminder(invoice({ dueDate: "2026-10-16" }), ai, TODAY);
+  assert.match(calls[0]?.[1]?.content ?? "", /Days overdue: not overdue\./);
 });
