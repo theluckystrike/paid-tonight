@@ -268,6 +268,22 @@ function normalizeUnpaid(raw) {
   };
 }
 
+function normalizeStatus(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const status = asText(raw.status, "");
+  return {
+    id: asText(raw.id, ""),
+    number: asText(raw.number, ""),
+    status,
+    customerName: asText(raw.customerName, "Customer"),
+    total: moneyText(raw.total),
+    paidAmount: moneyText(raw.paidAmount),
+    dueAmount: raw.dueAmount == null || raw.dueAmount === "" ? null : moneyText(raw.dueAmount),
+    currency: currencyOf(raw.currency),
+    paid: raw.paid === true || status === "PAID" || status === "MARKED_AS_PAID",
+  };
+}
+
 // Optional access code for the PayPal actions, asked once and kept for this browser tab only.
 function accessCode() {
   try { return sessionStorage.getItem("pt-code") || ""; } catch (err) { return ""; }
@@ -332,7 +348,32 @@ async function sendDraftRequest(draft, fetchFn) {
 async function listUnpaidRequest(fetchFn) {
   const data = await request("/api/unpaid", { method: "GET" }, fetchFn);
   const list = Array.isArray(data) ? data : (data && Array.isArray(data.invoices) ? data.invoices : []);
-  return list.map(normalizeUnpaid).filter(Boolean);
+  const paid = data && Array.isArray(data.paidToday) ? data.paidToday : [];
+  return {
+    invoices: list.map(normalizeUnpaid).filter(Boolean),
+    paidToday: paid.map(normalizeStatus).filter(Boolean),
+  };
+}
+
+async function invoiceStatusRequest(id, fetchFn) {
+  const data = await request(`/api/invoice/${encodeURIComponent(id)}/status`, { method: "GET" }, fetchFn);
+  const status = normalizeStatus(data && data.invoice ? data.invoice : data);
+  if (!status) throw new ApiError(0, "The server returned an unexpected response.");
+  return status;
+}
+
+async function recordPaymentRequest(id, fetchFn) {
+  const data = await request(`/api/invoice/${encodeURIComponent(id)}/record-payment`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  }, fetchFn);
+  if (data && data.pending === true) {
+    return { pending: true, message: asText(data.message, "PayPal is still recording the payment. Tap Refresh in a minute."), status: null };
+  }
+  const status = normalizeStatus(data && data.invoice ? data.invoice : data);
+  if (!status) throw new ApiError(0, "The server returned an unexpected response.");
+  return { pending: false, message: "", status };
 }
 
 async function draftReminderRequest(id, fetchFn) {
@@ -428,6 +469,29 @@ function showError(node, message) {
 function clearError(node) {
   node.textContent = "";
   node.hidden = true;
+}
+
+// A recording PayPal has not confirmed yet: show the message and a Refresh button, never an error.
+function pendingNotice(message, onRefresh) {
+  const wrap = el("div", "pending-notice");
+  const text = el("p", "pending-notice__text", message);
+  const refreshBtn = el("button", "btn btn--small", "Refresh");
+  refreshBtn.type = "button";
+  refreshBtn.addEventListener("click", async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "Refreshing...";
+    try {
+      await onRefresh();
+      wrap.remove();
+    } catch (err) {
+      text.textContent = friendlyMessage(err);
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = "Refresh";
+    }
+  });
+  wrap.append(text, refreshBtn);
+  return wrap;
 }
 
 function totalsLine(label, amount, strong) {
@@ -626,6 +690,72 @@ async function handleSend(ui, sendBtn) {
   }
 }
 
+function buildStatusBox(invoiceId, initial, onPaid) {
+  const box = el("div", "status-box");
+  const line = el("p", "status-box__line");
+  const detail = el("p", "muted status-box__detail");
+  const errorBox = el("p", "error");
+  errorBox.hidden = true;
+  errorBox.setAttribute("role", "alert");
+  const refreshBtn = el("button", "btn btn--ghost", "Refresh");
+  refreshBtn.type = "button";
+  const cashBtn = el("button", "btn btn--small", "Paid in cash");
+  cashBtn.type = "button";
+  const actions = el("div", "status-box__actions");
+  actions.append(refreshBtn, cashBtn);
+
+  const apply = (status) => {
+    const paid = Boolean(status && status.paid);
+    box.classList.toggle("status-box--paid", paid);
+    line.textContent = paid ? "Paid" : `Status ${status.status || "unknown"}`;
+    const bits = [];
+    if (status.total && Number(status.total) > 0) bits.push(`Total ${formatMoney(status.total, status.currency)}`);
+    if (paid) bits.push(`Paid ${formatMoney(status.paidAmount, status.currency)}`);
+    else if (status.dueAmount != null) bits.push(`Due ${formatMoney(status.dueAmount, status.currency)}`);
+    detail.textContent = bits.join(" \u00b7 ");
+    cashBtn.hidden = paid;
+    if (paid && typeof onPaid === "function") onPaid(status);
+  };
+
+  refreshBtn.addEventListener("click", async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "Refreshing...";
+    clearError(errorBox);
+    try {
+      apply(await invoiceStatusRequest(invoiceId));
+    } catch (err) {
+      showError(errorBox, friendlyMessage(err));
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = "Refresh";
+    }
+  });
+
+  cashBtn.addEventListener("click", async () => {
+    if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm("Record this invoice as paid in cash? PayPal will mark it paid.")) return;
+    cashBtn.disabled = true;
+    clearError(errorBox);
+    try {
+      const result = await recordPaymentRequest(invoiceId);
+      if (result.pending) {
+        line.textContent = result.message;
+        detail.textContent = "";
+        cashBtn.hidden = true;
+      } else {
+        apply(result.status);
+      }
+    } catch (err) {
+      showError(errorBox, friendlyMessage(err));
+    } finally {
+      cashBtn.disabled = false;
+    }
+  });
+
+  apply(initial);
+  box.append(line, detail, errorBox, actions);
+  return box;
+}
+
 function showSuccess(ui, result) {
   ui.preview.hidden = true;
   const card = el("div", "card card--success");
@@ -633,6 +763,7 @@ function showSuccess(ui, result) {
   card.append(el("p", "muted", result.emailed ? "PayPal emailed it to your customer. They can also scan to pay now." : "No email on the invoice: show the QR code or share the pay link."));
   card.append(el("p", "success__number", `Invoice ${result.number || result.id || ""}${result.amount ? " \u00b7 " + result.amount : ""}`));
   if (result.partial) card.append(el("p", "muted", "The invoice is sent. PayPal did not return every detail just now; open it from the Unpaid tab."));
+  if (result.id) card.append(buildStatusBox(result.id, { status: "SENT", total: "", paidAmount: "0.00", dueAmount: null, currency: "", paid: false }, null));
 
   if (result.qr) {
     const img = document.createElement("img");
@@ -691,6 +822,10 @@ function unpaidRow(ui, invoice) {
   btn.type = "button";
   btn.addEventListener("click", () => handleDraftReminder(ui, invoice, btn));
   bottom.append(btn);
+  const cashBtn = el("button", "btn btn--small", "Paid in cash");
+  cashBtn.type = "button";
+  cashBtn.addEventListener("click", () => handleRecordPayment(ui, invoice, cashBtn));
+  bottom.append(cashBtn);
   row.append(top, bottom);
   if (invoice.status === "PARTIALLY_PAID" && invoice.dueAmount) {
     row.append(el("p", "unpaid-row__due", `Still due ${formatMoney(invoice.dueAmount, invoice.currency)} of ${formatMoney(invoice.total, invoice.currency)}`));
@@ -707,15 +842,54 @@ function renderUnpaidList(ui, list) {
   for (const invoice of list) ui.unpaidList.append(unpaidRow(ui, invoice));
 }
 
+function renderPaidToday(ui, list) {
+  if (!ui.paidToday) return;
+  ui.paidToday.replaceChildren();
+  if (!list.length) {
+    ui.paidToday.hidden = true;
+    return;
+  }
+  ui.paidToday.hidden = false;
+  ui.paidToday.append(el("h3", "paid-today__title", "Paid today"));
+  for (const invoice of list) {
+    const row = el("div", "paid-today__row");
+    row.append(el("span", "paid-today__name", invoice.customerName || invoice.number || invoice.id || "Customer"));
+    row.append(el("span", "paid-today__amount", formatMoney(invoice.paidAmount || invoice.total, invoice.currency)));
+    row.append(el("span", "paid-today__status", invoice.status === "MARKED_AS_PAID" ? "Marked as paid" : "Paid"));
+    ui.paidToday.append(row);
+  }
+}
+
 async function loadUnpaid(ui) {
   ui.unpaidList.replaceChildren(el("p", "muted", "Loading..."));
   clearError(ui.unpaidError);
   try {
-    const list = await listUnpaidRequest();
-    renderUnpaidList(ui, list);
+    const data = await listUnpaidRequest();
+    renderUnpaidList(ui, data.invoices);
+    renderPaidToday(ui, data.paidToday);
   } catch (err) {
     ui.unpaidList.replaceChildren();
+    if (ui.paidToday) ui.paidToday.hidden = true;
     showError(ui.unpaidError, friendlyMessage(err));
+  }
+}
+
+async function handleRecordPayment(ui, invoice, btn) {
+  if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(`Record ${formatMoney(invoice.total, invoice.currency)} as paid in cash? PayPal will mark it paid.`)) return;
+  btn.disabled = true;
+  clearError(ui.unpaidError);
+  try {
+    const result = await recordPaymentRequest(invoice.id);
+    if (result.pending) {
+      const row = btn.closest ? btn.closest(".unpaid-row") : null;
+      if (row) row.append(pendingNotice(result.message, () => loadUnpaid(ui)));
+    } else {
+      await loadUnpaid(ui);
+    }
+  } catch (err) {
+    showError(ui.unpaidError, friendlyMessage(err));
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -878,6 +1052,7 @@ function grabElements() {
     success: byId("success"),
     unpaidError: byId("unpaid-error"),
     unpaidList: byId("unpaid-list"),
+    paidToday: byId("paid-today"),
     reminderEditor: byId("reminder-editor"),
     chipButtons: Array.from(document.querySelectorAll(".chip")),
   };
@@ -919,9 +1094,12 @@ export {
   normalizeTotals,
   normalizeDraft,
   normalizeUnpaid,
+  normalizeStatus,
   createDraftRequest,
   sendDraftRequest,
   listUnpaidRequest,
+  invoiceStatusRequest,
+  recordPaymentRequest,
   draftReminderRequest,
   sendReminderRequest,
   friendlyMessage,

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest } from "../web/app.js";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
@@ -41,4 +41,31 @@ test("R6: reminder actions use a 2 column grid and the primary button spans the 
   assert.match(app, /actions actions--reminder/);
   assert.match(css, /\.actions--reminder\s*\{[^}]*grid-template-columns:\s*repeat\(2,/);
   assert.match(css, /@media \(max-width: 419px\)\s*\{[\s\S]*?\.actions--reminder \.btn--primary\s*\{[^}]*grid-column:\s*1 \/ -1/);
+});
+
+test("record payment: a pending 202 becomes a message, not an error", async () => {
+  const pendingFetch = (async () => new Response(
+    JSON.stringify({ pending: true, message: "PayPal is still recording the payment. Tap Refresh in a minute." }),
+    { status: 202, headers: { "Content-Type": "application/json" } },
+  )) as unknown as typeof fetch;
+  const result = await recordPaymentRequest("INV-1", pendingFetch);
+  assert.equal(result.pending, true);
+  assert.equal(result.status, null);
+  assert.equal(result.message, "PayPal is still recording the payment. Tap Refresh in a minute.");
+});
+
+test("record payment: a recorded payment returns the invoice status", async () => {
+  const okFetch = (async () => new Response(
+    JSON.stringify({ invoice: { id: "INV-1", status: "MARKED_AS_PAID", total: "20.00", paidAmount: "20.00", dueAmount: "0.00", currency: "USD", paid: true } }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  )) as unknown as typeof fetch;
+  const result = await recordPaymentRequest("INV-1", okFetch);
+  assert.equal(result.pending, false);
+  assert.equal(result.status?.status, "MARKED_AS_PAID");
+  assert.equal(result.status?.paid, true);
+});
+
+test("record payment: the pending result shows the message with a Refresh button, never the error line", () => {
+  assert.match(app, /function pendingNotice\(message, onRefresh\)[\s\S]*?"Refresh"[\s\S]*?wrap\.append\(text, refreshBtn\)/);
+  assert.match(app, /if \(result\.pending\) \{[\s\S]*?pendingNotice\(result\.message/);
 });

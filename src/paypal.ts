@@ -1,12 +1,25 @@
 import { PayPalError } from "./types";
-import type { InvoiceDraft, UnpaidInvoice } from "./types";
+import type { InvoiceDraft, InvoiceStatus, UnpaidInvoice } from "./types";
 import { invoiceDiscount, toPayPalItems } from "./money";
 import { splitCustomerName } from "./names";
 
 const DEFAULT_BASE = "https://api-m.sandbox.paypal.com";
-const TIMEOUT_MS = 8000;
+/** Default per-call timeout: every call but a record payment uses this. */
+export const TIMEOUT_MS = 8000;
+/** Recording a payment is the one call that may take longer, so it gets its own timeout. */
+export const PAYMENT_TIMEOUT_MS = 30000;
+/** Verifying a webhook must give PayPal's answer time to arrive before we call it a failure. */
+export const VERIFY_TIMEOUT_MS = 20000;
 const BASE64_LINE = /^[A-Za-z0-9+/]+={0,2}$/;
 const HEADER_LINE = /^[A-Za-z0-9-]+:/;
+export const WEBHOOK_EVENTS = ["INVOICING.INVOICE.PAID", "INVOICING.INVOICE.CANCELLED", "INVOICING.INVOICE.REFUNDED"] as const;
+export const PAID_STATUSES = new Set(["PAID", "MARKED_AS_PAID"]);
+export const PENDING_PAYMENT_MESSAGE = "PayPal is still recording the payment. Tap Refresh in a minute.";
+
+/** A record payment call did not return and a fresh read cannot confirm the money is in yet. */
+export class PaymentPendingError extends Error {
+  constructor(message: string = PENDING_PAYMENT_MESSAGE) { super(message); this.name = "PaymentPendingError"; }
+}
 
 export class PayPal {
   private readonly clientId: string;
@@ -96,6 +109,76 @@ export class PayPal {
     return res.json();
   }
 
+  /** Read one invoice's status, paid amount and due amount from PayPal. */
+  async getStatus(id: string): Promise<InvoiceStatus> {
+    return mapStatus(await this.get(id), id);
+  }
+
+  /**
+   * Record money handed over at the door as CASH for the full amount still due. PayPal owns the resulting status,
+   * so the answer comes from a fresh read, never from the app.
+   */
+  async recordPayment(id: string, paymentDate: string): Promise<InvoiceStatus> {
+    const current = await this.getStatus(id);
+    if (current.paid || current.dueAmount === "0.00") throw new PayPalError(409, "PayPal reports nothing due on this invoice.");
+    const amount = current.dueAmount;
+    try {
+      await this.request("POST", `/v2/invoicing/invoices/${encodeURIComponent(id)}/payments`, {
+        body: JSON.stringify({ method: "CASH", payment_date: paymentDate, amount: { currency_code: current.currency, value: amount } }),
+        contentType: "application/json",
+        // A fresh id per tap: PayPal treats each as its own request, while the read above stops a second one when nothing is due.
+        requestId: `cash-${id}-${paymentDate}-${crypto.randomUUID()}`,
+        timeoutMs: PAYMENT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      if (!(err instanceof PayPalError) || err.status !== 0) throw err;
+      // The request timed out or the connection dropped: PayPal may still have recorded it, so read once before deciding.
+      const after = await this.getStatus(id).catch(() => null);
+      if (after && paymentCovered(after)) return after;
+      throw new PaymentPendingError();
+    }
+    return this.getStatus(id);
+  }
+
+  /**
+   * Ask PayPal whether a webhook really came from it, using every transmission header.
+   * Only an explicit FAILURE answer returns false. A transport error, a timeout or an answer without a
+   * verification status throws, so the caller can tell "PayPal said no" apart from "we could not ask".
+   */
+  async verifyWebhook(event: unknown, headers: Record<string, string>, webhookId: string): Promise<boolean> {
+    const res = await this.request("POST", "/v1/notifications/verify-webhook-signature", {
+      body: JSON.stringify({
+        auth_algo: headers["paypal-auth-algo"] ?? "",
+        cert_url: headers["paypal-cert-url"] ?? "",
+        transmission_id: headers["paypal-transmission-id"] ?? "",
+        transmission_sig: headers["paypal-transmission-sig"] ?? "",
+        transmission_time: headers["paypal-transmission-time"] ?? "",
+        webhook_id: webhookId,
+        webhook_event: event,
+      }),
+      contentType: "application/json",
+      timeoutMs: VERIFY_TIMEOUT_MS,
+    });
+    const data = (await res.json().catch(() => null)) as { verification_status?: unknown } | null;
+    const status = data?.verification_status;
+    if (status === "SUCCESS") return true;
+    if (status === "FAILURE") return false;
+    throw new PayPalError(0, "PayPal did not answer whether the webhook signature is valid.");
+  }
+
+  /** Register this worker's webhook URL for the three invoice events and return PayPal's webhook id. */
+  async registerWebhook(url: string): Promise<{ id: string }> {
+    const res = await this.request("POST", "/v1/notifications/webhooks", {
+      body: JSON.stringify({
+        url,
+        event_types: WEBHOOK_EVENTS.map((name) => ({ name })),
+      }),
+      contentType: "application/json",
+    });
+    const data = (await res.json().catch(() => null)) as { id?: unknown } | null;
+    return { id: typeof data?.id === "string" ? data.id : "" };
+  }
+
   async listUnpaid(): Promise<UnpaidInvoice[]> {
     const keep = new Set(["SENT", "UNPAID", "PARTIALLY_PAID"]);
     const out: UnpaidInvoice[] = [];
@@ -121,7 +204,7 @@ export class PayPal {
     });
   }
 
-  private async request(method: string, path: string, opts: { body?: string; contentType?: string; requestId?: string } = {}): Promise<Response> {
+  private async request(method: string, path: string, opts: { body?: string; contentType?: string; requestId?: string; timeoutMs?: number } = {}): Promise<Response> {
     const build = async () => {
       const headers: Record<string, string> = { Authorization: `Bearer ${await this.token()}` };
       if (opts.contentType) headers["Content-Type"] = opts.contentType;
@@ -129,23 +212,23 @@ export class PayPal {
       return headers;
     };
     try {
-      return await this.rawRequest(method, path, { headers: await build(), body: opts.body });
+      return await this.rawRequest(method, path, { headers: await build(), body: opts.body, timeoutMs: opts.timeoutMs });
     } catch (err) {
       // An expired or revoked token: drop it and retry once with a fresh one.
       if (!(err instanceof PayPalError) || err.status !== 401) throw err;
       this.tokenValue = null;
-      return this.rawRequest(method, path, { headers: await build(), body: opts.body });
+      return this.rawRequest(method, path, { headers: await build(), body: opts.body, timeoutMs: opts.timeoutMs });
     }
   }
 
-  private async rawRequest(method: string, path: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
+  private async rawRequest(method: string, path: string, opts: { headers?: Record<string, string>; body?: string; timeoutMs?: number } = {}): Promise<Response> {
     let res: Response;
     try {
       res = await this.fetchFn(`${this.base}${path}`, {
         method,
         headers: opts.headers,
         body: opts.body,
-        signal: AbortSignal.timeout(TIMEOUT_MS),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
       });
     } catch (err) {
       throw new PayPalError(0, err instanceof Error ? err.message : "PayPal request failed");
@@ -233,6 +316,75 @@ export function mapInvoice(raw: unknown): UnpaidInvoice | null {
     invoiceDate: typeof detail.invoice_date === "string" ? detail.invoice_date : null,
     payUrl: payUrlOf(raw, detail),
   };
+}
+
+/** Map a PayPal invoice (or a webhook resource) to the small status shape the app shows. */
+export function mapStatus(raw: unknown, fallbackId = ""): InvoiceStatus {
+  const data = isObject(raw) ? raw : {};
+  const invoice = mapInvoice(raw);
+  const id = invoice?.id ?? fallbackId;
+  const status = invoice?.status ?? "";
+  const total = invoice?.total ?? "0.00";
+  const due = dueForStatus(data, status, total);
+  const paid = paidForStatus(data, status, total, due);
+  return {
+    id,
+    number: invoice?.number ?? "",
+    status,
+    customerName: invoice?.customerName ?? "",
+    total,
+    paidAmount: paid,
+    dueAmount: due,
+    currency: invoice?.currency ?? "",
+    paid: PAID_STATUSES.has(status),
+  };
+}
+
+/** PayPal says the invoice is settled: a PAID status, or a paid amount that already covers the total. */
+function paymentCovered(status: InvoiceStatus): boolean {
+  if (status.paid) return true;
+  const paid = centsOf(status.paidAmount);
+  const total = centsOf(status.total);
+  return paid != null && total != null && total > 0n && paid >= total;
+}
+
+function amountValue(v: unknown): string | null {
+  const amount = isObject(v) ? v : {};
+  return typeof amount.value === "string" ? amount.value : null;
+}
+
+function dueForStatus(raw: Record<string, unknown>, status: string, total: string): string {
+  const fromDue = amountValue(raw.due_amount);
+  if (fromDue) return fromDue;
+  const amount = isObject(raw.amount) ? raw.amount : {};
+  const nested = amountValue(amount.due_amount);
+  if (nested) return nested;
+  if (PAID_STATUSES.has(status) || status === "CANCELLED" || status === "REFUNDED") return "0.00";
+  return total;
+}
+
+function paidForStatus(raw: Record<string, unknown>, status: string, total: string, due: string): string {
+  const explicit = amountValue(raw.paid_amount);
+  if (explicit) return explicit;
+  const payments = isObject(raw.payments) ? raw.payments : {};
+  const fromPayments = amountValue(payments.paid_amount);
+  if (fromPayments) return fromPayments;
+  if (PAID_STATUSES.has(status)) return total;
+  if (status === "CANCELLED" || status === "REFUNDED" || status === "DRAFT" || status === "SENT" || status === "UNPAID") return "0.00";
+  const t = centsOf(total);
+  const d = centsOf(due);
+  if (t == null || d == null) return "0.00";
+  return fromCents(t > d ? t - d : 0n);
+}
+
+function centsOf(value: string): bigint | null {
+  if (!/^\d+(\.\d{1,2})?$/.test(value)) return null;
+  const [whole = "0", frac = ""] = value.split(".");
+  return BigInt(whole) * 100n + BigInt((frac + "00").slice(0, 2));
+}
+
+function fromCents(cents: bigint): string {
+  return `${cents / 100n}.${(cents % 100n).toString().padStart(2, "0")}`;
 }
 
 /** The balance outstanding after payments. PayPal returns it at the top level for partially paid invoices. */

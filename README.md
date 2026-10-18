@@ -28,6 +28,7 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does, confirmed against the live sandbox. A percentage discount is baked into the unit prices and tax is computed per line on the discounted line amount, each rounded half up. A fixed discount is split across the lines in exact cents with the remainder on the largest line and baked into the unit prices the same way when each line's share divides exactly by its quantity; when it cannot, PayPal takes the discount at invoice level, after tax, and the draft carries a warning that VAT is charged on the full price. A discount the model writes as an item is turned back into a discount, and a percentage discount such as "10 percent off", "10 % Rabatt" or "descuento del 15 %" is computed from the subtotal. Tax rates may have up to 3 decimals. Customer honorifics are removed before the name is split, and a Polish name after u, dla or od gets a warning to check it. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged, links are removed from the note, and amounts above 100,000 are refused. Warnings you should check also cover a zero price, a zero total after a 100 percent discount, and a tax or discount that is mentioned but not applied.
 4. You correct anything in the preview (customer, items, currency, discount, tax) and tap "Send with PayPal". The server validates the edited draft again, creates the invoice with an invoice number tied to this draft and its content (a retry can never create or email a second invoice, and a corrected draft is never sent as the old one), reads back PayPal's own total and sends only if it equals the total you saw. You get the invoice number, the pay link and the PayPal QR code. Without an email, PayPal emails nobody and you share the QR code or link.
 5. In the Unpaid tab, the reminder agent reads your open invoices from PayPal and drafts a message, friendly when the invoice is due or slightly late and firm after 14 days. PayPal's reminder endpoint ignores custom text, so the app says so. "Send PayPal reminder" sends PayPal's standard reminder with the pay button, and "Email this message" opens your own email with the drafted text.
+6. The success card reads the invoice back from PayPal on Refresh and shows the real status, the paid amount and the amount still due. When PayPal says PAID or MARKED_AS_PAID the card becomes a green Paid state. "Paid in cash" asks for a confirmation, records the payment with PayPal as CASH for the full amount due, then reads the invoice again. The Unpaid tab drops an invoice that a verified webhook reported as paid and shows it in a small Paid today list.
 
 ## PayPal APIs used (sandbox)
 
@@ -40,6 +41,38 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 | `POST /v2/invoicing/invoices/{id}/generate-qr-code` | QR code for paying on the spot |
 | `GET /v2/invoicing/invoices` | List open invoices for the reminder agent |
 | `POST /v2/invoicing/invoices/{id}/remind` | PayPal's standard reminder, only for an invoice that is still unpaid |
+| `GET /v2/invoicing/invoices/{id}` | Live status, paid amount and due amount for the success card and Refresh |
+| `POST /v2/invoicing/invoices/{id}/payments` | Record a cash payment at the door for the amount due, with method CASH and today's date |
+| `POST /v1/notifications/verify-webhook-signature` | Verify every PayPal webhook with its transmission headers and `PAYPAL_WEBHOOK_ID` |
+| `POST /v1/notifications/webhooks` | Register the worker webhook URL for PAID, CANCELLED and REFUNDED |
+
+## App endpoints
+
+| Endpoint | Why |
+|---|---|
+| `GET /api/invoice/{id}/status` | Prefer PayPal's live read, fall back to a stored webhook status only when the read fails |
+| `POST /api/invoice/{id}/record-payment` | Record a confirmed cash payment through PayPal, guarded like send |
+| `POST /api/paypal/webhook` | Verify and store PAID, CANCELLED and REFUNDED events, idempotent by event id |
+| `POST /api/admin/register-webhook` | Owner-only setup, needs the `ADMIN_CODE` secret in the `x-admin-code` header |
+
+## Webhooks
+
+Every event is checked with PayPal before anything is stored. A failed check is refused. A replayed event id changes nothing. The latest status per invoice is kept in the LIMITS KV for 30 days, and the status endpoint still reads PayPal live, so the stored value is only a hint and a fallback. The Unpaid tab uses it to drop invoices that just became paid.
+
+To register the webhook on a deployed worker, set an admin secret first, call the setup route once, then store the returned id.
+
+```bash
+npx wrangler secret put ADMIN_CODE
+curl -X POST https://your-worker.workers.dev/api/admin/register-webhook \
+  -H "content-type: application/json" \
+  -H "x-admin-code: YOUR_ADMIN_CODE" \
+  -d "{}"
+npx wrangler secret put PAYPAL_WEBHOOK_ID
+```
+
+The setup route uses the worker origin it was called on plus `/api/paypal/webhook`, registers exactly those three event types and returns `webhookId`. Store that value as `PAYPAL_WEBHOOK_ID`. The route refuses every request when `ADMIN_CODE` is not set.
+
+The cash flow is honest about its source. The demo marks a cash payment through PayPal's own Invoicing API, so the paid status comes from PayPal. No local flag pretends the invoice was paid.
 
 ## AI tools used
 
@@ -61,7 +94,7 @@ The public demo has a daily cap of 60 AI calls so it stays inside the free allow
 
 ## Status
 
-The AI extraction, money rules and the whole send flow are live and connected to the PayPal sandbox. A live sandbox run created and sent an invoice for 146.90 EUR, returned the QR code and pay link, returned the same invoice on a retry, listed it as unpaid and sent a PayPal reminder. The tests use a fake PayPal that follows the Invoicing v2 API.
+The AI extraction, money rules, send flow and the payment loop are live and connected to the PayPal sandbox. A live sandbox run created and sent an invoice for 146.90 EUR, returned the QR code and pay link, returned the same invoice on a retry, listed it as unpaid and sent a PayPal reminder. The status, cash payment, webhook and webhook setup routes are covered by tests against a fake PayPal that follows the Invoicing v2 and Notifications APIs.
 
 ## Run it
 
@@ -69,9 +102,11 @@ The AI extraction, money rules and the whole send flow are live and connected to
 npm install
 npx wrangler secret put PAYPAL_CLIENT_ID      # sandbox app from developer.paypal.com
 npx wrangler secret put PAYPAL_CLIENT_SECRET
-npx wrangler secret put DEMO_SEND_CODE        # optional, an access code for send, unpaid and reminders
+npx wrangler secret put DEMO_SEND_CODE        # optional, an access code for send, unpaid, reminders and cash payments
+npx wrangler secret put ADMIN_CODE            # required only for the webhook setup route
+npx wrangler secret put PAYPAL_WEBHOOK_ID     # after the setup route returns the webhook id
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 127 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 142 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License

@@ -23,6 +23,16 @@ export interface UnpaidInvoice {
   payUrl: string | null;
 }
 
+/** A live read of one invoice, the same shape from PayPal and from a stored webhook event. */
+export interface InvoiceStatus {
+  id: string; number: string; status: string; customerName: string;
+  total: string; paidAmount: string; dueAmount: string; currency: string;
+  paid: boolean;
+}
+
+/** One invoice that a verified webhook reported as paid, kept for the Paid today list. */
+export interface PaidInvoice extends InvoiceStatus { paidAt: string }
+
 export class PayPalError extends Error {
   constructor(public status: number, message: string, public debugId?: string) { super(message); this.name = "PayPalError"; }
 }

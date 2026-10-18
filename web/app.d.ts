@@ -37,3 +37,22 @@ export function normalizeUnpaid(raw: unknown): {
   invoiceDate: string | null;
   payUrl: string | null;
 } | null;
+
+export function normalizeStatus(raw: unknown): {
+  id: string;
+  number: string;
+  status: string;
+  customerName: string;
+  total: string;
+  paidAmount: string;
+  dueAmount: string | null;
+  currency: string;
+  paid: boolean;
+} | null;
+
+export function invoiceStatusRequest(id: string, fetchFn?: typeof fetch): Promise<ReturnType<typeof normalizeStatus>>;
+export function recordPaymentRequest(id: string, fetchFn?: typeof fetch): Promise<{
+  pending: boolean;
+  message: string;
+  status: ReturnType<typeof normalizeStatus>;
+}>;

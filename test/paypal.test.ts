@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PayPal } from "../src/paypal";
+import { PaymentPendingError, PENDING_PAYMENT_MESSAGE, TIMEOUT_MS, PAYMENT_TIMEOUT_MS, VERIFY_TIMEOUT_MS } from "../src/paypal";
 import { PayPalError } from "../src/types";
 import type { InvoiceDraft } from "../src/types";
 
@@ -495,4 +496,249 @@ test("R3: createDraft sends a 3 decimal tax percent as a string", async () => {
   const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
   const body = JSON.parse(create?.body ?? "{}");
   assert.equal(body.items[0].tax.percent, "8.875");
+});
+
+test("status: a PAID invoice reports the full paid amount and nothing due", async () => {
+  const { fetch, calls } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({
+    id: "INV-PAID", status: "PAID", detail: { invoice_number: "PT-9" },
+    amount: { currency_code: "EUR", value: "121.00" }, due_amount: { currency_code: "EUR", value: "0.00" },
+    primary_recipients: [{ billing_info: { name: { full_name: "Ola" } } }],
+  }));
+  const pp = new PayPal("cid", "sec", fetch);
+  const status = await pp.getStatus("INV-PAID");
+  assert.deepEqual(status, {
+    id: "INV-PAID", number: "PT-9", status: "PAID", customerName: "Ola",
+    total: "121.00", paidAmount: "121.00", dueAmount: "0.00", currency: "EUR", paid: true,
+  });
+  assert.equal(calls.filter((c) => c.path === "/v2/invoicing/invoices/INV-PAID").length, 1);
+});
+
+test("status: a PARTIALLY_PAID invoice reports paid amount and due amount", async () => {
+  const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({
+    id: "INV-PART", status: "PARTIALLY_PAID", detail: { invoice_number: "PT-10" },
+    amount: { currency_code: "USD", value: "100.00" }, due_amount: { currency_code: "USD", value: "35.50" },
+    primary_recipients: [],
+  }));
+  const pp = new PayPal("cid", "sec", fetch);
+  const status = await pp.getStatus("INV-PART");
+  assert.equal(status.status, "PARTIALLY_PAID");
+  assert.equal(status.total, "100.00");
+  assert.equal(status.paidAmount, "64.50");
+  assert.equal(status.dueAmount, "35.50");
+  assert.equal(status.paid, false);
+});
+
+test("record-payment: posts CASH for the amount due on the payment date, then reads PayPal again", async () => {
+  let paid = false;
+  const { fetch, calls } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    if (req.path === "/v2/invoicing/invoices/INV-CASH/payments") {
+      paid = true;
+      return json({ payment_id: "PAY-1" }, 200);
+    }
+    return json({
+      id: "INV-CASH", status: paid ? "MARKED_AS_PAID" : "UNPAID", detail: { invoice_number: "PT-11" },
+      amount: { currency_code: "GBP", value: "80.00" }, due_amount: { currency_code: "GBP", value: paid ? "0.00" : "80.00" },
+      primary_recipients: [],
+    });
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  const status = await pp.recordPayment("INV-CASH", "2026-10-18");
+  assert.equal(status.status, "MARKED_AS_PAID");
+  assert.equal(status.paid, true);
+  const payment = calls.find((c) => c.path.endsWith("/payments"));
+  assert.ok(payment);
+  assert.equal(payment.method, "POST");
+  assert.deepEqual(JSON.parse(payment.body ?? "{}"), {
+    method: "CASH", payment_date: "2026-10-18",
+    amount: { currency_code: "GBP", value: "80.00" },
+  });
+});
+
+test("webhook: verification sends every transmission header and the event", async () => {
+  const { fetch, calls } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ verification_status: "SUCCESS" }));
+  const pp = new PayPal("cid", "sec", fetch);
+  const event = { id: "WH-E-1", event_type: "INVOICING.INVOICE.PAID", resource: { id: "INV-1" } };
+  const ok = await pp.verifyWebhook(event, {
+    "paypal-auth-algo": "SHA256withRSA",
+    "paypal-cert-url": "https://api.paypal.com/cert.pem",
+    "paypal-transmission-id": "tid-1",
+    "paypal-transmission-sig": "sig-1",
+    "paypal-transmission-time": "2026-10-18T10:00:00Z",
+  }, "WH-1");
+  assert.equal(ok, true);
+  const verify = calls.find((c) => c.path === "/v1/notifications/verify-webhook-signature");
+  assert.ok(verify);
+  assert.deepEqual(JSON.parse(verify.body ?? "{}"), {
+    auth_algo: "SHA256withRSA",
+    cert_url: "https://api.paypal.com/cert.pem",
+    transmission_id: "tid-1",
+    transmission_sig: "sig-1",
+    transmission_time: "2026-10-18T10:00:00Z",
+    webhook_id: "WH-1",
+    webhook_event: event,
+  });
+});
+
+test("webhook: a failed verification is false, not a success", async () => {
+  const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ verification_status: "FAILURE" }));
+  const pp = new PayPal("cid", "sec", fetch);
+  assert.equal(await pp.verifyWebhook({ id: "E" }, {}, "WH-1"), false);
+});
+
+test("webhook: verification gets a 20 second timeout, not the 8 second default", async () => {
+  assert.equal(VERIFY_TIMEOUT_MS, 20000);
+  const seen: number[] = [];
+  const real = AbortSignal.timeout;
+  (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout = (ms) => { seen.push(ms); return real.call(AbortSignal, ms); };
+  try {
+    const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ verification_status: "SUCCESS" }));
+    const pp = new PayPal("cid", "sec", fetch);
+    await pp.verifyWebhook({ id: "E" }, {}, "WH-1");
+  } finally {
+    (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = real;
+  }
+  assert.ok(seen.includes(VERIFY_TIMEOUT_MS));
+});
+
+test("webhook: an answer with no verification status throws instead of reading as a failure", async () => {
+  const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ message: "ok" }));
+  const pp = new PayPal("cid", "sec", fetch);
+  await assert.rejects(() => pp.verifyWebhook({ id: "E" }, {}, "WH-1"), PayPalError);
+});
+
+test("webhook: a transport error while verifying throws, it is not a failed verification", async () => {
+  const { fetch } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    throw new Error("network down");
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  await assert.rejects(() => pp.verifyWebhook({ id: "E" }, {}, "WH-1"));
+});
+
+test("register-webhook: posts the URL and the three invoice event types", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "WH-NEW" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  const result = await pp.registerWebhook("https://paid.example.workers.dev/api/paypal/webhook");
+  assert.equal(result.id, "WH-NEW");
+  const create = calls.find((c) => c.path === "/v1/notifications/webhooks");
+  assert.ok(create);
+  assert.deepEqual(JSON.parse(create.body ?? "{}"), {
+    url: "https://paid.example.workers.dev/api/paypal/webhook",
+    event_types: [
+      { name: "INVOICING.INVOICE.PAID" },
+      { name: "INVOICING.INVOICE.CANCELLED" },
+      { name: "INVOICING.INVOICE.REFUNDED" },
+    ],
+  });
+});
+
+function openInvoice(id: string, extra: Record<string, unknown> = {}): Response {
+  return json({
+    id, status: "UNPAID", detail: { invoice_number: id },
+    amount: { currency_code: "USD", value: "40.00" }, due_amount: { currency_code: "USD", value: "40.00" },
+    primary_recipients: [], ...extra,
+  });
+}
+
+test("timeouts: 30 seconds for the record payment POST, 8 seconds for every other call", async () => {
+  assert.equal(TIMEOUT_MS, 8000);
+  assert.equal(PAYMENT_TIMEOUT_MS, 30000);
+  const seen: number[] = [];
+  const real = AbortSignal.timeout;
+  (AbortSignal as unknown as { timeout: (ms: number) => AbortSignal }).timeout = (ms) => { seen.push(ms); return real.call(AbortSignal, ms); };
+  try {
+    const { fetch } = makeFetch((req) => {
+      if (req.path === "/v1/oauth2/token") return tokenResponse();
+      if (req.path.endsWith("/payments")) return json({ payment_id: "PAY-1" });
+      return openInvoice("INV-T");
+    });
+    const pp = new PayPal("cid", "sec", fetch);
+    await pp.get("INV-T");
+    await pp.recordPayment("INV-T", "2026-10-18");
+  } finally {
+    (AbortSignal as unknown as { timeout: typeof AbortSignal.timeout }).timeout = real;
+  }
+  assert.equal(seen.filter((ms) => ms === PAYMENT_TIMEOUT_MS).length, 1);
+  assert.ok(seen.every((ms) => ms === TIMEOUT_MS || ms === PAYMENT_TIMEOUT_MS));
+  assert.ok(seen.filter((ms) => ms === TIMEOUT_MS).length >= 3);
+});
+
+test("timeouts: a lost record payment that PayPal did mark paid is success after one read", async () => {
+  let posted = false;
+  const { fetch, calls } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    if (req.path.endsWith("/payments")) { posted = true; throw new Error("The operation was aborted due to timeout"); }
+    return posted
+      ? openInvoice("INV-TP", { status: "MARKED_AS_PAID", due_amount: { currency_code: "USD", value: "0.00" } })
+      : openInvoice("INV-TP");
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  const status = await pp.recordPayment("INV-TP", "2026-10-18");
+  assert.equal(status.status, "MARKED_AS_PAID");
+  assert.equal(status.paid, true);
+  assert.equal(calls.filter((c) => c.path.endsWith("/payments")).length, 1);
+});
+
+test("timeouts: a lost record payment whose paid amount already covers the total is success", async () => {
+  let posted = false;
+  const { fetch } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    if (req.path.endsWith("/payments")) { posted = true; throw new Error("The operation was aborted due to timeout"); }
+    return posted
+      ? openInvoice("INV-TC", { status: "PARTIALLY_PAID", paid_amount: { currency_code: "USD", value: "40.00" }, due_amount: { currency_code: "USD", value: "0.00" } })
+      : openInvoice("INV-TC");
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  const status = await pp.recordPayment("INV-TC", "2026-10-18");
+  assert.equal(status.paid, false);
+  assert.equal(status.paidAmount, "40.00");
+  assert.equal(status.total, "40.00");
+});
+
+test("timeouts: a lost record payment with nothing paid yet is pending, not a failure", async () => {
+  const { fetch } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    if (req.path.endsWith("/payments")) throw new Error("The operation was aborted due to timeout");
+    return openInvoice("INV-TN");
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  await assert.rejects(() => pp.recordPayment("INV-TN", "2026-10-18"), (err: unknown) => {
+    assert.ok(err instanceof PaymentPendingError);
+    assert.equal((err as Error).message, PENDING_PAYMENT_MESSAGE);
+    return true;
+  });
+});
+
+test("record-payment: each tap posts a fresh PayPal-Request-Id", async () => {
+  const { fetch, calls } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    if (req.path.endsWith("/payments")) return json({ payment_id: "PAY-1" });
+    return openInvoice("INV-RID");
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.recordPayment("INV-RID", "2026-10-18");
+  await pp.recordPayment("INV-RID", "2026-10-18");
+  const ids = calls.filter((c) => c.path.endsWith("/payments")).map((c) => c.headers["PayPal-Request-Id"]);
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+  for (const id of ids) {
+    assert.match(String(id), /^cash-INV-RID-2026-10-18-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  }
+});
+
+test("record-payment: nothing due is refused with 409 before any POST", async () => {
+  const { fetch, calls } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    return openInvoice("INV-DONE", { status: "PAID", due_amount: { currency_code: "USD", value: "0.00" } });
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  await assert.rejects(() => pp.recordPayment("INV-DONE", "2026-10-18"), (err: unknown) => {
+    assert.ok(err instanceof PayPalError);
+    assert.equal((err as PayPalError).status, 409);
+    return true;
+  });
+  assert.equal(calls.filter((c) => c.path.endsWith("/payments")).length, 0);
 });

@@ -1,9 +1,9 @@
 import { extractDraft } from "./extract.js";
 import { takeAiCall, type Counter } from "./limit.js";
 import { discountWarning, totals } from "./money.js";
-import { PayPal } from "./paypal.js";
+import { mapStatus, PAID_STATUSES, PaymentPendingError, PayPal, WEBHOOK_EVENTS } from "./paypal.js";
 import { draftReminder } from "./reminder.js";
-import { ExtractError, PayPalError, type AiRunner, type InvoiceDraft } from "./types.js";
+import { ExtractError, PayPalError, type AiRunner, type InvoiceDraft, type InvoiceStatus } from "./types.js";
 import { DraftInvalid, validateDraft } from "./validate.js";
 
 interface Env {
@@ -14,9 +14,19 @@ interface Env {
   PAYPAL_CLIENT_SECRET?: string;
   BUSINESS_NAME?: string;
   AI_LIMIT?: { limit(o: { key: string }): Promise<{ success: boolean }> };
-  /** Optional: when set, the PayPal routes (send, unpaid, reminder, remind) need this code in the x-demo-code header. */
+  /** Optional: when set, the PayPal routes (send, unpaid, reminder, remind, record payment) need this code in the x-demo-code header. */
   DEMO_SEND_CODE?: string;
+  /** Set by the owner after POST /api/admin/register-webhook returns it. Every webhook is checked against it. */
+  PAYPAL_WEBHOOK_ID?: string;
+  /** Required for the admin webhook setup route. When it is not set, that route refuses every request. */
+  ADMIN_CODE?: string;
 }
+
+const WEBHOOK_TTL = 30 * 86400;
+const WEBHOOK_EVENT_PREFIX = "webhook:event:";
+const WEBHOOK_INVOICE_PREFIX = "webhook:invoice:";
+const PAID_TODAY_PREFIX = "webhook:paid:";
+const NOT_OPEN = new Set([...PAID_STATUSES, "CANCELLED", "REFUNDED"]);
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const today = () => new Date().toISOString().slice(0, 10);
@@ -57,7 +67,7 @@ async function body<T>(request: Request): Promise<T> {
 
 type Handler = (request: Request, env: Env) => Promise<Response>;
 
-const GUARDED = new Set(["POST /api/send", "GET /api/unpaid", "POST /api/reminder", "POST /api/remind"]);
+const GUARDED = new Set(["POST /api/send", "GET /api/unpaid", "POST /api/reminder", "POST /api/remind", "POST /api/invoice/{id}/record-payment"]);
 
 /** Constant-time comparison of the access code. */
 function sameCode(a: string, b: string): boolean {
@@ -136,6 +146,159 @@ function invoiceInfo(inv: unknown): { number: string; href: string | null; amoun
   };
 }
 
+interface WebhookRecord extends InvoiceStatus { eventId: string; at: string }
+
+async function readJson<T>(kv: Counter | undefined, key: string): Promise<T | null> {
+  if (!kv) return null;
+  try { return JSON.parse((await kv.get(key)) ?? "null") as T | null; } catch { return null; }
+}
+
+async function storedStatus(env: Env, id: string): Promise<WebhookRecord | null> {
+  return readJson<WebhookRecord>(env.LIMITS, `${WEBHOOK_INVOICE_PREFIX}${id}`);
+}
+
+async function paidToday(env: Env): Promise<WebhookRecord[]> {
+  const list = await readJson<WebhookRecord[]>(env.LIMITS, `${PAID_TODAY_PREFIX}${today()}`);
+  return Array.isArray(list) ? list.filter((r) => r && PAID_STATUSES.has(r.status)) : [];
+}
+
+async function addPaidToday(env: Env, record: WebhookRecord): Promise<void> {
+  if (!env.LIMITS) return;
+  const key = `${PAID_TODAY_PREFIX}${today()}`;
+  const list = (await readJson<WebhookRecord[]>(env.LIMITS, key)) ?? [];
+  const next = list.filter((r) => r && r.id !== record.id);
+  next.push(record);
+  await env.LIMITS.put(key, JSON.stringify(next), { expirationTtl: WEBHOOK_TTL });
+}
+
+function webhookHeaders(request: Request): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of ["paypal-auth-algo", "paypal-cert-url", "paypal-transmission-id", "paypal-transmission-sig", "paypal-transmission-time"]) {
+    out[name] = request.headers.get(name) ?? "";
+  }
+  return out;
+}
+
+function headerValue(request: Request, ...names: string[]): string {
+  for (const name of names) {
+    const value = request.headers.get(name);
+    if (value) return value;
+  }
+  return "";
+}
+
+/**
+ * The invoice of an INVOICING.INVOICE.* event. PayPal nests it under resource.invoice on some deliveries and
+ * puts it at resource directly on others, so both shapes are read.
+ */
+function eventStatus(event: { event_type?: unknown; resource?: unknown }): InvoiceStatus {
+  const resource = event.resource;
+  const inner = resource && typeof resource === "object" && !Array.isArray(resource)
+    ? (resource as { invoice?: unknown }).invoice
+    : null;
+  const source = inner && typeof inner === "object" && !Array.isArray(inner) ? inner : resource;
+  const mapped = mapStatus(source);
+  if (mapped.status) return mapped;
+  const type = typeof event.event_type === "string" ? event.event_type : "";
+  const fallback = type.endsWith(".CANCELLED") ? "CANCELLED" : type.endsWith(".REFUNDED") ? "REFUNDED" : "PAID";
+  return { ...mapped, status: fallback, paid: PAID_STATUSES.has(fallback) };
+}
+
+/** One safe line per webhook: the event type, the event id and a reason code, and never a header, body or secret. */
+function webhookLog(type: string, eventId: string, reason: string): void {
+  const safe = (value: string) => value.replace(/[^\x20-\x7E]/g, "").slice(0, 120);
+  console.log(`paypal webhook ${safe(type)} ${safe(eventId)} ${reason}`);
+}
+
+async function handleWebhook(req: Request, env: Env): Promise<Response> {
+  const text = await req.text();
+  if (text.length > 200_000) {
+    webhookLog("", "", "ignored");
+    return Response.json({ error: "The event is too large." }, { status: 400 });
+  }
+  let event: { id?: unknown; event_type?: unknown; resource?: unknown };
+  try { event = JSON.parse(text) as typeof event; } catch {
+    webhookLog("", "", "ignored");
+    return Response.json({ error: "Send the webhook event as JSON." }, { status: 400 });
+  }
+  const type = typeof event.event_type === "string" ? event.event_type : "";
+  const eventId = typeof event.id === "string" ? event.id : "";
+  if (!env.PAYPAL_WEBHOOK_ID) {
+    webhookLog(type, eventId, "verify_error");
+    return Response.json({ error: "Webhook verification is not configured." }, { status: 503 });
+  }
+  let verified: boolean;
+  try {
+    verified = await paypal(env).verifyWebhook(event, webhookHeaders(req), env.PAYPAL_WEBHOOK_ID);
+  } catch {
+    // Verification itself failed (network, timeout, PayPal error): ask PayPal to send the event again later.
+    webhookLog(type, eventId, "verify_error");
+    return Response.json({ error: "The webhook could not be verified right now. PayPal will retry this event." }, { status: 503 });
+  }
+  if (!verified) {
+    webhookLog(type, eventId, "verify_failure");
+    return Response.json({ error: "Webhook signature did not verify." }, { status: 400 });
+  }
+  if (!eventId) {
+    webhookLog(type, eventId, "ignored");
+    return Response.json({ error: "The event has no id." }, { status: 400 });
+  }
+  const eventKey = `${WEBHOOK_EVENT_PREFIX}${eventId}`;
+  if (await env.LIMITS?.get(eventKey)) {
+    webhookLog(type, eventId, "duplicate");
+    return Response.json({ ok: true, duplicate: true });
+  }
+  if (!(WEBHOOK_EVENTS as readonly string[]).includes(type)) {
+    await env.LIMITS?.put(eventKey, "1", { expirationTtl: WEBHOOK_TTL });
+    webhookLog(type, eventId, "ignored");
+    return Response.json({ ok: true, ignored: true });
+  }
+  const status = eventStatus(event);
+  if (!status.id) {
+    webhookLog(type, eventId, "no_invoice_id");
+    return Response.json({ error: "The event has no invoice id." }, { status: 400 });
+  }
+  const record: WebhookRecord = { ...status, eventId, at: new Date().toISOString() };
+  await env.LIMITS?.put(`${WEBHOOK_INVOICE_PREFIX}${status.id}`, JSON.stringify(record), { expirationTtl: WEBHOOK_TTL });
+  await addPaidToday(env, record);
+  await env.LIMITS?.put(eventKey, "1", { expirationTtl: WEBHOOK_TTL });
+  webhookLog(type, eventId, "stored");
+  return Response.json({ ok: true, duplicate: false, status: record.status });
+}
+
+async function invoiceStatus(env: Env, id: string): Promise<Response> {
+  const hint = await storedStatus(env, id);
+  try {
+    const live = await paypal(env).getStatus(id);
+    return Response.json({ ...live, invoice: live, source: "paypal" });
+  } catch (err) {
+    if (hint) return Response.json({ ...hint, invoice: hint, source: "webhook" });
+    throw err;
+  }
+}
+
+async function recordPayment(req: Request, env: Env, id: string): Promise<Response> {
+  await body<Record<string, unknown>>(req);
+  try {
+    const status = await paypal(env).recordPayment(id, today());
+    return Response.json({ ...status, invoice: status, source: "paypal" });
+  } catch (err) {
+    if (err instanceof PaymentPendingError) return Response.json({ pending: true, message: err.message }, { status: 202 });
+    throw err;
+  }
+}
+
+async function registerWebhook(req: Request, env: Env): Promise<Response> {
+  if (!env.ADMIN_CODE) return Response.json({ error: "Webhook setup is disabled because ADMIN_CODE is not set." }, { status: 503 });
+  if (!sameCode(headerValue(req, "x-admin-code", "admin-code", "admin_code"), env.ADMIN_CODE)) {
+    return Response.json({ error: "This action needs the admin code." }, { status: 401 });
+  }
+  const url = `${new URL(req.url).origin}/api/paypal/webhook`;
+  const { id } = await paypal(env).registerWebhook(url);
+  if (!id) return Response.json({ error: "PayPal did not return a webhook id." }, { status: 502 });
+  return Response.json({ webhookId: id, url, events: WEBHOOK_EVENTS });
+}
+
 const routes: Record<string, Handler> = {
   "POST /api/draft": async (req, env) => {
     await perAddress(req, env);
@@ -151,7 +314,15 @@ const routes: Record<string, Handler> = {
     return Response.json({ totals: totals(validateDraft(draft)) });
   },
   "POST /api/send": async (req, env) => send(req, env),
-  "GET /api/unpaid": async (_req, env) => Response.json({ invoices: await paypal(env).listUnpaid() }),
+  "GET /api/unpaid": async (_req, env) => {
+    const invoices = [];
+    for (const invoice of await paypal(env).listUnpaid()) {
+      const hint = await storedStatus(env, invoice.id);
+      if (hint && NOT_OPEN.has(hint.status)) continue;
+      invoices.push(invoice);
+    }
+    return Response.json({ invoices, paidToday: await paidToday(env) });
+  },
   "POST /api/reminder": async (req, env) => {
     await perAddress(req, env);
     const { id } = await body<{ id?: string }>(req);
@@ -166,17 +337,31 @@ const routes: Record<string, Handler> = {
     await pp.remind(id);
     return Response.json({ ok: true });
   },
+  "POST /api/paypal/webhook": async (req, env) => handleWebhook(req, env),
+  "POST /api/admin/register-webhook": async (req, env) => registerWebhook(req, env),
 };
+
+/** Match the fixed routes plus the two per-invoice routes, and keep one guard key for each. */
+function matchRoute(method: string, pathname: string): { key: string; handler: Handler } | null {
+  const fixed = routes[`${method} ${pathname}`];
+  if (fixed) return { key: `${method} ${pathname}`, handler: fixed };
+  const m = /^\/api\/invoice\/([^/]+)\/(status|record-payment)$/.exec(pathname);
+  if (!m) return null;
+  let id: string;
+  try { id = decodeURIComponent(m[1]!); } catch { return null; }
+  if (m[2] === "status" && method === "GET") return { key: `${method} /api/invoice/{id}/status`, handler: (_req, env) => invoiceStatus(env, id) };
+  if (m[2] === "record-payment" && method === "POST") return { key: `${method} /api/invoice/{id}/record-payment`, handler: (req, env) => recordPayment(req, env, id) };
+  return null;
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
-    const routeKey = `${request.method} ${pathname}`;
-    const handler = routes[routeKey];
-    if (handler && env.DEMO_SEND_CODE && GUARDED.has(routeKey) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
+    const route = matchRoute(request.method, pathname);
+    if (route && env.DEMO_SEND_CODE && GUARDED.has(route.key) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
       return Response.json({ error: "This action needs the access code.", needCode: true }, { status: 401 });
     }
-    if (!handler) return pathname.startsWith("/api/") ? Response.json({ error: "Not found." }, { status: 404 }) : env.ASSETS.fetch(request);
-    try { return await handler(request, env); } catch (err) { return fail(err); }
+    if (!route) return pathname.startsWith("/api/") ? Response.json({ error: "Not found." }, { status: 404 }) : env.ASSETS.fetch(request);
+    try { return await route.handler(request, env); } catch (err) { return fail(err); }
   },
 };
