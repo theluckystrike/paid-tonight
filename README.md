@@ -2,7 +2,7 @@
 
 <img src="docs/cover.jpg" alt="Paid Tonight" width="800">
 
-Finish the job, say what you did, and get paid before you leave. Paid Tonight turns a plain description of a job into a PayPal invoice with line items, discount, tax and a QR code the customer can scan on the spot. A second agent watches unpaid invoices. It sends PayPal's standard reminder when you tap it, and drafts a personal message you can send by email in your own words. Built by Michael Lip, [github.com/theluckystrike](https://github.com/theluckystrike), for the PayPal AI Hackathon.
+Finish the job, say what you did, and get paid before you leave. Paid Tonight turns a plain description of a job into a PayPal invoice with line items, discount, tax and a QR code the customer can scan on the spot. The Unpaid tab reads your open invoices from PayPal. It sends PayPal's standard reminder when you tap it, and a second AI step drafts a personal message you can send by email in your own words. Built by Michael Lip, [github.com/theluckystrike](https://github.com/theluckystrike), for the PayPal AI Hackathon.
 
 > "Replaced the kitchen tap for Anna Kowalski, anna@example.com, 2 hours labour at 45 an hour, tap was 89.99, plus 23 percent VAT."
 
@@ -25,7 +25,7 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 
 1. You type or speak the job. The browser's speech recognition fills the text box.
 2. The AI reads it and returns the customer, the email, each item with quantity and unit price, a discount, the tax rate and a short note. It never does the arithmetic. The job text is passed to the model as data inside tags, and the model is told to ignore instructions in it.
-3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does, confirmed against the live sandbox. Tax is computed per line on the full line amount, each rounded half up, and an invoice discount is subtracted after tax. A discount the model writes as an item is turned back into a discount, and "10 percent off" is computed from the subtotal. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged, links are removed from the note, and amounts above 100,000 are refused. Warnings you should check also cover a zero price and a tax or discount that is mentioned but not applied.
+3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does, confirmed against the live sandbox. Tax is computed per line on the full line amount, each rounded half up, and an invoice discount is subtracted after tax. A discount the model writes as an item is turned back into a discount, and "10 percent off" in English is computed from the subtotal. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged, links are removed from the note, and amounts above 100,000 are refused. Warnings you should check also cover a zero price and a tax or discount that is mentioned but not applied.
 4. You correct anything in the preview (customer, items, currency, discount, tax) and tap "Send with PayPal". The server validates the edited draft again, creates the invoice with an invoice number tied to this draft and its content (a retry can never create or email a second invoice, and a corrected draft is never sent as the old one), reads back PayPal's own total and sends only if it equals the total you saw. You get the invoice number, the pay link and the PayPal QR code. Without an email, PayPal emails nobody and you share the QR code or link.
 5. In the Unpaid tab, the reminder agent reads your open invoices from PayPal and drafts a message, friendly when the invoice is due or slightly late and firm after 14 days. PayPal's reminder endpoint ignores custom text, so the app says so. "Send PayPal reminder" sends PayPal's standard reminder with the pay button, and "Email this message" opens your own email with the drafted text.
 
@@ -71,7 +71,7 @@ npx wrangler secret put PAYPAL_CLIENT_ID      # sandbox app from developer.paypa
 npx wrangler secret put PAYPAL_CLIENT_SECRET
 npx wrangler secret put DEMO_SEND_CODE        # optional: an access code for send, unpaid and reminders
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 82 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 84 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License

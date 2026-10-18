@@ -31,6 +31,9 @@ export function validateDraft(input: unknown): InvoiceDraft {
   const r = draftSchema.safeParse(input);
   if (!r.success) throw new DraftInvalid(r.error.issues.map((i) => `${i.path.join(".") || "draft"} ${i.message}`));
   const draft = { ...r.data, warnings: r.data.warnings ?? [] } as InvoiceDraft;
-  try { totals(draft); } catch (err) { throw new DraftInvalid([err instanceof Error ? err.message : "totals failed"]); }
+  let t: ReturnType<typeof totals>;
+  try { t = totals(draft); } catch (err) { throw new DraftInvalid([err instanceof Error ? err.message : "totals failed"]); }
+  // Same ceiling as extraction, so an edited draft cannot send what a fresh one would refuse.
+  if (Number(t.total) >= 100_000) throw new DraftInvalid(["The total is above 100,000. Check the amounts and try again."]);
   return draft;
 }
