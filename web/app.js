@@ -207,6 +207,17 @@ function computeTotals(draft) {
   return { subtotal: centsToStr(subtotal), discount: centsToStr(plan.totalDiscount), tax: centsToStr(tax), total: centsToStr(subtotal - plan.totalDiscount + tax) };
 }
 
+// The preview keeps one source of truth for the discount. A percent wins: any fixed amount is dropped, so the server
+// never sees two discounts, and the amount box shows exactly the discount discountPlan computes. Typing an amount
+// clears the percent. The server runs the same discountPlan, so the browser total and the server total stay equal.
+function discountChoice(draft) {
+  const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "";
+  if (!percent) return { draft: { ...draft, discountPercent: null }, amount: draft.discount || "", locked: false };
+  const clean = { ...draft, discount: null };
+  const cents = discountPlan(clean).totalDiscount;
+  return { draft: clean, amount: cents > 0n ? centsToStr(cents) : "", locked: true };
+}
+
 function newDraftId() {
   const bytes = new Uint8Array(8);
   crypto.getRandomValues(bytes);
@@ -250,6 +261,27 @@ function formatMoney(amount, currency) {
   } catch {
     return `${CURRENCY_SYMBOLS[code] || code}${safe.toFixed(2)}`;
   }
+}
+
+// The local calendar day, so a payment made at 11pm sits under today, not tomorrow's UTC date. Same rule as the
+// server's Paid today key, but read on the visitor's own clock, because the server cannot know their time zone.
+function localDay(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return null;
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
+
+// Keep only the Paid today rows that fall on the browser's local calendar day. A row without a timestamp is kept,
+// because there is nothing to compare and the server already decided it belongs to today.
+function paidTodayFor(records, now) {
+  const today = localDay(now == null ? new Date() : now);
+  return records.filter((record) => {
+    if (!record || !record.at) return true;
+    const day = localDay(record.at);
+    return day == null || day === today;
+  });
 }
 
 function calendarDaysPastDue(invoice, today) {
@@ -362,6 +394,7 @@ function normalizeStatus(raw) {
     dueAmount: raw.dueAmount == null || raw.dueAmount === "" ? null : moneyText(raw.dueAmount),
     currency: currencyOf(raw.currency),
     paid: raw.paid === true || status === "PAID" || status === "MARKED_AS_PAID",
+    at: raw.at ? asText(raw.at, "") : null,
   };
 }
 
@@ -705,6 +738,10 @@ function buildPreview(ui) {
   );
 
   const sync = () => {
+    const choice = discountChoice(state.draft);
+    state.draft = choice.draft;
+    discountInput.readOnly = choice.locked;
+    if (choice.locked || !state.draft.discount) discountInput.value = choice.amount;
     state.totals = computeTotals(state.draft);
     renderTotals(totalsBox, warningsBox);
   };
@@ -719,11 +756,19 @@ function buildPreview(ui) {
   });
   if (!state.draftId) state.draftId = newDraftId();
   currencySelect.addEventListener("change", () => { state.draft.currency = currencySelect.value; sync(); });
-  discountInput.addEventListener("input", () => { state.draft.discount = discountInput.value.trim() || null; sync(); });
-  discountPercentInput.addEventListener("input", () => { state.draft.discountPercent = discountPercentInput.value.trim() || null; sync(); });
+  discountInput.addEventListener("input", () => {
+    state.draft.discount = discountInput.value.trim() || null;
+    if (state.draft.discount != null) state.draft.discountPercent = null;
+    sync();
+  });
+  discountPercentInput.addEventListener("input", () => {
+    state.draft.discountPercent = discountPercentInput.value.trim() || null;
+    if (state.draft.discountPercent == null) discountInput.value = "";
+    sync();
+  });
   wirePreviewControls(ui, { nameInput, emailInput, taxInput, noteInput, backBtn, sendBtn }, sync);
 
-  renderTotals(totalsBox, warningsBox);
+  sync();
   ui.preview.replaceChildren(card);
   ui.preview.hidden = false;
   card.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -965,7 +1010,7 @@ async function loadUnpaid(ui) {
   try {
     const data = await listUnpaidRequest();
     renderUnpaidList(ui, data.invoices);
-    renderPaidToday(ui, data.paidToday);
+    renderPaidToday(ui, paidTodayFor(data.paidToday));
   } catch (err) {
     ui.unpaidList.replaceChildren();
     if (ui.paidToday) ui.paidToday.hidden = true;
@@ -1179,10 +1224,13 @@ export {
   roundHalfUp,
   lineTotalCents,
   computeTotals,
+  discountChoice,
   centsToStr,
   decimalText,
   moneyText,
   formatMoney,
+  localDay,
+  paidTodayFor,
   daysOverdue,
   calendarDaysPastDue,
   qrDataUrl,

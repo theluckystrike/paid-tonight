@@ -1,3 +1,5 @@
+import type { InvoiceDraft } from "../src/types";
+
 export interface BrowserTotals {
   subtotal: string;
   discount: string;
@@ -28,6 +30,12 @@ export function computeWarnings(draft: {
   discountPercent?: string | null;
 }): string[];
 
+export function discountChoice(draft: InvoiceDraft): { draft: InvoiceDraft; amount: string; locked: boolean };
+
+export function localDay(date: Date | string | number): string | null;
+
+export function paidTodayFor<T extends { at?: string | null }>(records: T[], now?: Date | string | number): T[];
+
 export function reminderMailto(invoice: BrowserInvoice, subject: string, note: string): string;
 export function overdueLabel(invoice: BrowserInvoice, today?: string): { text: string; className: string };
 export function daysOverdue(invoice: BrowserInvoice, today?: string): number | null;
@@ -57,6 +65,7 @@ export function normalizeStatus(raw: unknown): {
   dueAmount: string | null;
   currency: string;
   paid: boolean;
+  at: string | null;
 } | null;
 
 export function invoiceStatusRequest(id: string, fetchFn?: typeof fetch): Promise<ReturnType<typeof normalizeStatus>>;

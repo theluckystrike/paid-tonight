@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor } from "../web/app.js";
+import { totals } from "../src/money";
+import { validateDraft } from "../src/validate";
+import type { InvoiceDraft } from "../src/types";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
@@ -101,4 +104,105 @@ test("R10: the unpaid row wraps on a narrow screen", () => {
 test("R10: the cash confirm shows the amount due", () => {
   assert.match(app, /handleRecordPayment[\s\S]*?invoice\.dueAmount \|\| invoice\.total[\s\S]*?as paid in cash/);
   assert.match(app, /Record \$\{amount\} as paid in cash/);
+});
+
+// A percent draft as the server returns it: the extracted fixed share sits next to the percent. Editing any number
+// makes the stale share disagree, which is the live 422 until the amount box is cleared.
+function percentDraft(): InvoiceDraft {
+  return {
+    customerName: "Herr Weber", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [],
+    discount: "147.83", discountPercent: "10",
+    items: [
+      { name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" },
+      { name: "Heizung", quantity: "1", unitAmount: "1249.00" },
+    ],
+  };
+}
+
+test("R11: editing hours on a percent draft keeps one source of truth, so totals match and Send is accepted", () => {
+  const draft = percentDraft();
+  draft.items[0]!.quantity = "4";
+  assert.throws(() => validateDraft(draft));
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discount, null);
+  assert.equal(choice.draft.discountPercent, "10");
+  assert.equal(choice.locked, true);
+  assert.equal(choice.amount, computeTotals(choice.draft).discount);
+  assert.deepEqual(computeTotals(choice.draft), totals(choice.draft));
+  assert.doesNotThrow(() => validateDraft(choice.draft));
+  assert.equal(validateDraft(choice.draft).discount, null);
+});
+
+test("R11: editing a unit price on a percent draft keeps one source of truth", () => {
+  const draft = percentDraft();
+  draft.items[1]!.unitAmount = "1199.00";
+  assert.throws(() => validateDraft(draft));
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discount, null);
+  assert.equal(choice.amount, computeTotals(choice.draft).discount);
+  assert.deepEqual(computeTotals(choice.draft), totals(choice.draft));
+  assert.doesNotThrow(() => validateDraft(choice.draft));
+});
+
+test("R11: editing the percent on a percent draft keeps one source of truth", () => {
+  const draft = percentDraft();
+  draft.discountPercent = "12";
+  assert.throws(() => validateDraft(draft));
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discount, null);
+  assert.equal(choice.amount, computeTotals(choice.draft).discount);
+  assert.deepEqual(computeTotals(choice.draft), totals(choice.draft));
+  assert.doesNotThrow(() => validateDraft(choice.draft));
+});
+
+test("R11: the amount box shows the computed discount, so the line never differs from the field by a cent", () => {
+  const draft: InvoiceDraft = {
+    customerName: "A", customerEmail: null, currency: "GBP", taxPercent: null, note: null, warnings: [],
+    discount: "0.05", discountPercent: "3",
+    items: [
+      { name: "Work", quantity: "1", unitAmount: "1" },
+      { name: "Parts", quantity: "0.5", unitAmount: "1" },
+    ],
+  };
+  // The exact percent share is 0.05, the per line rounding makes the discount line 0.04: the old field showed 0.05.
+  assert.equal(totals(draft).discount, "0.04");
+  assert.equal(draft.discount, "0.05");
+  assert.notEqual(draft.discount, totals(draft).discount);
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discount, null);
+  assert.equal(choice.amount, "0.04");
+  assert.equal(choice.amount, totals(choice.draft).discount);
+  assert.deepEqual(computeTotals(choice.draft), totals(choice.draft));
+  assert.doesNotThrow(() => validateDraft(choice.draft));
+});
+
+test("R11: the preview keeps one discount source of truth and the Paid today list uses the local day", () => {
+  assert.match(app, /function discountChoice\(draft\)/);
+  assert.match(app, /const choice = discountChoice\(state\.draft\)/);
+  assert.match(app, /discountInput\.readOnly = choice\.locked/);
+  assert.match(app, /discountInput\.addEventListener\("input",[\s\S]*?state\.draft\.discountPercent = null[\s\S]*?sync\(\)/);
+  assert.match(app, /discountPercentInput\.addEventListener\("input",[\s\S]*?discountInput\.value = ""[\s\S]*?sync\(\)/);
+  assert.match(app, /renderPaidToday\(ui, paidTodayFor\(data\.paidToday\)\)/);
+  assert.match(app, /function localDay\(date\)/);
+});
+
+test("R11: localDay reads the browser's local calendar day, not the UTC date", () => {
+  assert.equal(localDay(new Date(2026, 9, 18, 23, 30, 0)), "2026-10-18");
+  assert.equal(localDay(new Date(2026, 9, 18, 0, 30, 0)), "2026-10-18");
+  assert.equal(localDay(new Date(2026, 0, 1, 0, 0, 0)), "2026-01-01");
+  assert.equal(localDay("not a date"), null);
+});
+
+test("R11: the Paid today list keeps only the browser's local calendar day", () => {
+  const now = new Date(2026, 9, 18, 12, 0, 0);
+  const rows = [
+    { id: "A", at: new Date(2026, 9, 18, 1, 0, 0).toISOString() },
+    { id: "B", at: new Date(2026, 9, 17, 23, 0, 0).toISOString() },
+    { id: "C", at: new Date(2026, 9, 19, 0, 30, 0).toISOString() },
+    { id: "D", at: null },
+  ];
+  assert.deepEqual(paidTodayFor(rows, now).map((r) => r.id), ["A", "D"]);
+  assert.deepEqual(paidTodayFor(rows, new Date(2030, 0, 1)).map((r) => r.id), ["D"]);
+  const noTime = [{ id: "E", at: undefined }];
+  assert.deepEqual(paidTodayFor(noTime, now).map((r) => r.id), ["E"]);
 });
