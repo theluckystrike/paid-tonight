@@ -60,31 +60,84 @@ function lineCentsFor(qScaled, unitCents) {
 }
 
 const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
+const BOTH_DISCOUNTS_WARNING = "Give either a discount amount or a discount percent, not both";
 
-function orderedBySize(lines) {
-  return lines
+function gcd(a, b) {
+  while (b > 0n) {
+    const t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+function shareStep(qScaled) {
+  if (qScaled <= 0n) return 0n;
+  return qScaled / gcd(qScaled, 1000n);
+}
+
+// Same rule as the server: split a fixed discount so each share divides by its quantity, leftover cents on a
+// quantity 1 line when one exists, and never more than the line can give. Null when it cannot bake, at invoice level.
+function allocateBakeable(lines, qScaled, unitCents, discount) {
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  if (discount <= 0n) return lines.map(() => 0n);
+  if (subtotal <= 0n) return null;
+  const steps = qScaled.map((q) => shareStep(q));
+  const caps = qScaled.map((q, i) => (q > 0n ? (unitCents[i] * q) / 1000n : 0n));
+  const shares = lines.map((line, i) => {
+    const step = steps[i];
+    if (step <= 0n) return 0n;
+    let base = (line * discount) / subtotal;
+    const cap = caps[i];
+    if (base > cap) base = cap;
+    return (base / step) * step;
+  });
+  let remainder = discount - shares.reduce((a, b) => a + b, 0n);
+  const order = lines
     .map((_, i) => i)
     .sort((a, b) => {
+      const sa = steps[a] === 1n ? 0 : 1;
+      const sb = steps[b] === 1n ? 0 : 1;
+      if (sa !== sb) return sa - sb;
       if (lines[a] > lines[b]) return -1;
       if (lines[a] < lines[b]) return 1;
       return a - b;
     });
+  for (const i of order) {
+    if (remainder <= 0n) break;
+    const step = steps[i];
+    if (step <= 0n) continue;
+    const room = caps[i] - shares[i];
+    if (room < step) continue;
+    const units = room / step;
+    const wanted = remainder / step;
+    const k = units < wanted ? units : wanted;
+    shares[i] += k * step;
+    remainder -= k * step;
+  }
+  if (remainder !== 0n) return null;
+  return shares;
 }
 
-function allocateDiscount(lines, discount) {
-  const allocated = lines.map(() => 0n);
-  const subtotal = lines.reduce((a, b) => a + b, 0n);
-  if (discount <= 0n || subtotal <= 0n) return allocated;
-  for (let i = 0; i < lines.length; i += 1) allocated[i] = (lines[i] * discount) / subtotal;
-  let remainder = discount - allocated.reduce((a, b) => a + b, 0n);
-  for (const i of orderedBySize(lines)) {
-    if (remainder <= 0n) break;
-    const room = lines[i] - allocated[i];
-    const added = remainder < room ? remainder : room;
-    allocated[i] += added;
-    remainder -= added;
+function effectiveHundredths(discount, subtotal) {
+  if (subtotal <= 0n) return 0n;
+  return (discount * 10000n + subtotal / 2n) / subtotal;
+}
+
+function offByMoreThanHalfPoint(discount, subtotal, pct) {
+  if (subtotal <= 0n) return false;
+  const effective = effectiveHundredths(discount, subtotal);
+  const diff = effective > pct ? effective - pct : pct - effective;
+  return diff > 50n;
+}
+
+function largestSingleLine(lines, qScaled) {
+  let best = -1;
+  for (let i = 0; i < qScaled.length; i += 1) {
+    if (qScaled[i] !== 1000n) continue;
+    if (best < 0 || lines[i] > lines[best]) best = i;
   }
-  return allocated;
+  return best;
 }
 
 function discountPlan(draft) {
@@ -94,18 +147,46 @@ function discountPlan(draft) {
   const subtotal = lines.reduce((a, b) => a + b, 0n);
   const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "" ? String(draft.discountPercent).trim() : null;
   const fixed = draft.discount != null && String(draft.discount).trim() !== "" ? String(draft.discount).trim() : null;
+  if (percent != null && fixed != null) {
+    const pct = scaledDecimal(percent, 2);
+    const share = (subtotal * pct + 5000n) / 10000n;
+    if (scaledDecimal(fixed, 2) !== share) {
+      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
+    }
+  }
   if (percent != null) {
-    const factor = 10000n - scaledDecimal(percent, 2);
+    const pct = scaledDecimal(percent, 2);
+    const factor = 10000n - pct;
     const reduced = unitCents.map((cents) => (cents * factor + 5000n) / 10000n);
-    const lineDiscount = reduced.map((cents, i) => lineCentsFor(qScaled[i], unitCents[i] - cents));
-    return { lines, unitCents: reduced, lineDiscount, totalDiscount: lineDiscount.reduce((a, b) => a + b, 0n), baked: true, percent, warning: null };
+    const reducedLines = reduced.map((cents, i) => lineCentsFor(qScaled[i], cents));
+    const lineDiscount = reducedLines.map((rl, i) => lines[i] - rl);
+    const totalDiscount = lineDiscount.reduce((a, b) => a + b, 0n);
+    if (offByMoreThanHalfPoint(totalDiscount, subtotal, pct)) {
+      const target = (subtotal * pct + 5000n) / 10000n;
+      const single = largestSingleLine(lines, qScaled);
+      if (single >= 0) {
+        const others = totalDiscount - lineDiscount[single];
+        let share = target - others;
+        if (share < 0n) share = 0n;
+        if (share > lines[single]) share = lines[single];
+        const adjusted = lineDiscount.slice();
+        const adjustedUnits = reduced.slice();
+        adjusted[single] = share;
+        adjustedUnits[single] = unitCents[single] - share;
+        const adjustedTotal = adjusted.reduce((a, b) => a + b, 0n);
+        if (!offByMoreThanHalfPoint(adjustedTotal, subtotal, pct)) {
+          return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, warning: null };
+        }
+      }
+      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, warning: INVOICE_DISCOUNT_WARNING };
+    }
+    return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, warning: null };
   }
   if (fixed != null) {
     let discount = scaledDecimal(fixed, 2);
     if (discount > subtotal) discount = subtotal;
-    const allocated = allocateDiscount(lines, discount);
-    const canBake = allocated.every((cents, i) => cents === 0n || (qScaled[i] > 0n && (cents * 1000n) % qScaled[i] === 0n));
-    if (canBake) {
+    const allocated = allocateBakeable(lines, qScaled, unitCents, discount);
+    if (allocated) {
       const reduced = allocated.map((cents, i) => unitCents[i] - (qScaled[i] > 0n ? (cents * 1000n) / qScaled[i] : 0n));
       return { lines, unitCents: reduced, lineDiscount: allocated, totalDiscount: discount, baked: true, percent: null, warning: null };
     }
@@ -585,10 +666,21 @@ function buildPreview(ui) {
     if (code === state.draft.currency) opt.selected = true;
     currencySelect.append(opt);
   }
-  const discountInput = makeInput("number", state.draft.discount || "", "Discount");
+  const discountInput = makeInput("number", state.draft.discount || "", "Discount amount");
   discountInput.min = "0";
   discountInput.step = "0.01";
   discountInput.placeholder = "Amount off the whole invoice (optional)";
+  const discountPercentInput = makeInput("number", state.draft.discountPercent || "", "Discount percent");
+  discountPercentInput.min = "0";
+  discountPercentInput.max = "100";
+  discountPercentInput.step = "any";
+  discountPercentInput.placeholder = "Percent off (optional)";
+  const discountRow = el("div", "discount-row");
+  const amountField = el("div", "field");
+  amountField.append(el("label", "field-label", "Discount"), discountInput);
+  const percentField = el("div", "field");
+  percentField.append(el("label", "field-label", "Discount (percent)"), discountPercentInput);
+  discountRow.append(amountField, percentField);
   const noteInput = el("textarea", "input input--note");
   noteInput.value = state.draft.note || "";
   noteInput.rows = 3;
@@ -605,7 +697,7 @@ function buildPreview(ui) {
     el("label", "field-label", "Email"), emailInput,
     el("h3", "card__sub", "Items"), itemsWrap, addBtn,
     el("label", "field-label", "Currency"), currencySelect,
-    el("label", "field-label", "Discount"), discountInput,
+    discountRow,
     el("label", "field-label", "Tax (percent)"), taxInput,
     el("label", "field-label", "Note"), noteInput,
     totalsBox, warningsBox,
@@ -628,6 +720,7 @@ function buildPreview(ui) {
   if (!state.draftId) state.draftId = newDraftId();
   currencySelect.addEventListener("change", () => { state.draft.currency = currencySelect.value; sync(); });
   discountInput.addEventListener("input", () => { state.draft.discount = discountInput.value.trim() || null; sync(); });
+  discountPercentInput.addEventListener("input", () => { state.draft.discountPercent = discountPercentInput.value.trim() || null; sync(); });
   wirePreviewControls(ui, { nameInput, emailInput, taxInput, noteInput, backBtn, sendBtn }, sync);
 
   renderTotals(totalsBox, warningsBox);
@@ -704,7 +797,10 @@ function buildStatusBox(invoiceId, initial, onPaid) {
   const actions = el("div", "status-box__actions");
   actions.append(refreshBtn, cashBtn);
 
+  let last = initial;
+
   const apply = (status) => {
+    last = status;
     const paid = Boolean(status && status.paid);
     box.classList.toggle("status-box--paid", paid);
     line.textContent = paid ? "Paid" : `Status ${status.status || "unknown"}`;
@@ -732,7 +828,10 @@ function buildStatusBox(invoiceId, initial, onPaid) {
   });
 
   cashBtn.addEventListener("click", async () => {
-    if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm("Record this invoice as paid in cash? PayPal will mark it paid.")) return;
+    const due = last && last.dueAmount != null ? last.dueAmount : last && last.total;
+    const amount = due ? formatMoney(due, last.currency) : "";
+    const question = amount ? `Record ${amount} as paid in cash? PayPal will mark it paid.` : "Record this invoice as paid in cash? PayPal will mark it paid.";
+    if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(question)) return;
     cashBtn.disabled = true;
     clearError(errorBox);
     try {
@@ -875,7 +974,8 @@ async function loadUnpaid(ui) {
 }
 
 async function handleRecordPayment(ui, invoice, btn) {
-  if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(`Record ${formatMoney(invoice.total, invoice.currency)} as paid in cash? PayPal will mark it paid.`)) return;
+  const due = invoice.dueAmount || invoice.total;
+  if (typeof window !== "undefined" && typeof window.confirm === "function" && !window.confirm(`Record ${formatMoney(due, invoice.currency)} as paid in cash? PayPal will mark it paid.`)) return;
   btn.disabled = true;
   clearError(ui.unpaidError);
   try {

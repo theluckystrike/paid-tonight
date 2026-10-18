@@ -110,6 +110,20 @@ body {
   margin: 14px 0 6px;
 }
 
+.discount-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.discount-row .field {
+  flex: 1 1 140px;
+}
+
+.discount-row .field-label {
+  margin-top: 14px;
+}
+
 .section-note {
   color: var(--muted);
   margin: 0 0 16px;
@@ -561,6 +575,7 @@ body {
 
 .unpaid-row__bottom {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 12px;

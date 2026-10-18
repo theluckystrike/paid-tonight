@@ -242,7 +242,7 @@ test("listUnpaid: filters statuses and maps fields", async () => {
   assert.deepEqual(list[0], {
     id: "INV-1", number: "0001", status: "SENT", customerName: "Anna Kowalski",
     customerEmail: "anna@example.com", total: "221.39", dueAmount: "221.39", currency: "USD",
-    dueDate: "2026-10-17", invoiceDate: "2026-10-17", payUrl: null,
+    dueDate: "2026-10-17", invoiceDate: "2026-10-17", payUrl: "https://www.sandbox.paypal.com/invoice/p/#INV1",
   });
   assert.equal(list[1]?.number, "0002");
   assert.equal(list[1]?.customerEmail, null);
@@ -384,6 +384,28 @@ test("R5: the unpaid invoice carries the recipient view link or a PayPal invoice
   const list = await pp.listUnpaid();
   assert.equal(list[0]?.payUrl, "https://www.sandbox.paypal.com/invoice/p/#L1");
   assert.equal(list[1]?.payUrl, "https://www.sandbox.paypal.com/invoice/p/#L2");
+});
+
+test("R5: the pay page hash drops the dashes and the INV2 prefix", async () => {
+  const { payPageHash } = await import("../src/paypal");
+  assert.equal(payPageHash("INV2-6TZL-TF37-58FD-DLNZ"), "6TZLTF3758FDDLNZ");
+  assert.equal(payPageHash("INV-1"), "INV1");
+});
+
+test("R5: the pay link is built from the invoice id and never an api.sandbox.paypal.com link", async () => {
+  const { mapInvoice } = await import("../src/paypal");
+  const row = mapInvoice({
+    id: "INV2-6TZL-TF37-58FD-DLNZ", status: "SENT", detail: { invoice_number: "PT-1" },
+    amount: { value: "10.00", currency_code: "EUR" },
+    links: [{ rel: "self", href: "https://api.sandbox.paypal.com/v2/invoicing/invoices/INV2-6TZL-TF37-58FD-DLNZ" }],
+  });
+  assert.equal(row?.payUrl, "https://www.sandbox.paypal.com/invoice/p/#6TZLTF3758FDDLNZ");
+  assert.equal(String(row?.payUrl).includes("api.sandbox"), false);
+});
+
+test("R5: a raw api link in links is ignored even without an id", async () => {
+  const { payUrlOf } = await import("../src/paypal");
+  assert.equal(payUrlOf({ links: [{ rel: "self", href: "https://api.sandbox.paypal.com/v2/invoicing/invoices/INV2-AB" }] }, {}), null);
 });
 
 test("R4: createDraft strips honorifics before splitting the name", async () => {

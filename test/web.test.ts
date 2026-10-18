@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings } from "../web/app.js";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
@@ -68,4 +68,37 @@ test("record payment: a recorded payment returns the invoice status", async () =
 test("record payment: the pending result shows the message with a Refresh button, never the error line", () => {
   assert.match(app, /function pendingNotice\(message, onRefresh\)[\s\S]*?"Refresh"[\s\S]*?wrap\.append\(text, refreshBtn\)/);
   assert.match(app, /if \(result\.pending\) \{[\s\S]*?pendingNotice\(result\.message/);
+});
+
+test("R10: the preview has a clearable discount percent field next to the amount, and edits to either recompute", () => {
+  assert.match(app, /discountPercentInput/);
+  assert.match(app, /Discount \(percent\)/);
+  assert.match(app, /discountPercentInput\.addEventListener\("input",[\s\S]*?state\.draft\.discountPercent[\s\S]*?sync\(\)/);
+  assert.match(app, /discountInput\.addEventListener\("input",[\s\S]*?state\.draft\.discount[\s\S]*?sync\(\)/);
+});
+
+test("R10: a percent and a fixed amount that disagree warns in the preview and drops neither total", () => {
+  const draft = {
+    customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [],
+    discount: "10.00", discountPercent: "10", items: [{ name: "Work", quantity: "1", unitAmount: "200" }],
+  };
+  assert.ok(computeWarnings(draft).some((w) => w.includes("not both")), computeWarnings(draft).join(" | "));
+  assert.equal(computeTotals(draft).total, "200.00");
+});
+
+test("R10: the browser computes the live German percentage case the way PayPal does", () => {
+  const draft = {
+    customerName: "Herr Weber", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [], discountPercent: "10",
+    items: [{ name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" }, { name: "Heizung", quantity: "1", unitAmount: "1249.00" }],
+  };
+  assert.equal(computeTotals(draft).total, "1583.21");
+});
+
+test("R10: the unpaid row wraps on a narrow screen", () => {
+  assert.match(css, /\.unpaid-row__bottom\s*\{[^}]*flex-wrap:\s*wrap/);
+});
+
+test("R10: the cash confirm shows the amount due", () => {
+  assert.match(app, /handleRecordPayment[\s\S]*?invoice\.dueAmount \|\| invoice\.total[\s\S]*?as paid in cash/);
+  assert.match(app, /Record \$\{amount\} as paid in cash/);
 });

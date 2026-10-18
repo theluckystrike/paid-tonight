@@ -29,7 +29,7 @@ interface Req {
   headers: Record<string, string>;
 }
 
-function fakePayPal(opts: { verify?: string; verifyError?: boolean; paymentTimesOut?: boolean; paymentTimesOutPaid?: boolean } = {}) {
+function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: boolean; paymentTimesOut?: boolean; paymentTimesOutPaid?: boolean } = {}) {
   const calls: Req[] = [];
   const invoices = new Map<string, InvoiceRow>();
   let verification = opts.verify ?? "SUCCESS";
@@ -44,6 +44,7 @@ function fakePayPal(opts: { verify?: string; verifyError?: boolean; paymentTimes
     if (u.pathname === "/v1/oauth2/token") return Response.json({ access_token: "t", expires_in: 3600 });
     if (u.pathname === "/v1/notifications/verify-webhook-signature") {
       if (opts.verifyError) return Response.json({ name: "INTERNAL_SERVER_ERROR" }, { status: 500 });
+      if (opts.verify4xx) return Response.json({ name: "INVALID_REQUEST" }, { status: 400 });
       return Response.json({ verification_status: verification });
     }
     if (u.pathname === "/v1/notifications/webhooks" && method === "POST") return Response.json({ id: "WH-NEW" }, { status: 201 });
@@ -111,7 +112,11 @@ function event(id: string, type: string, row: InvoiceRow) {
 
 const realFetch = globalThis.fetch;
 test.afterEach(() => { globalThis.fetch = realFetch; });
-const DAY = () => new Date().toISOString().slice(0, 10);
+/** The local calendar day, matching the worker's Paid today key and cash payment date. */
+const DAY = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
 test("status endpoint reads PayPal live and returns status, paid amount and due amount", async () => {
   const pp = fakePayPal();
@@ -339,6 +344,16 @@ test("webhook verification that errors asks PayPal to retry with 503 and stores 
   assert.equal(r.status, 503);
   assert.equal(limits.m.has("webhook:invoice:INV-ERR"), false);
   assert.equal(limits.m.has("webhook:event:EV-ERR"), false);
+});
+
+test("webhook verification answered with a 4xx is refused with 400, not a retry", async () => {
+  const pp = fakePayPal({ verify4xx: true });
+  const limits = kv();
+  const r = await call(envWith(pp, limits), "/api/paypal/webhook",
+    event("EV-4XX", "INVOICING.INVOICE.PAID", invoice("INV-4XX", "PAID", "10.00", "0.00")), webhookHeaders());
+  assert.equal(r.status, 400);
+  assert.equal(limits.m.has("webhook:invoice:INV-4XX"), false);
+  assert.equal(limits.m.has("webhook:event:EV-4XX"), false);
 });
 
 test("webhook logs one safe line per event with the type, the id and a reason code", async () => {

@@ -394,7 +394,23 @@ function dueAmountOf(raw: Record<string, unknown>, status: string, total: string
   return status === "PARTIALLY_PAID" ? null : total;
 }
 
-function payUrlOf(raw: Record<string, unknown>, detail: Record<string, unknown>): string | null {
+const PAYPAL_PAY_PAGE = "https://www.sandbox.paypal.com/invoice/p/#";
+
+/** PayPal's invoice id as it appears in the customer pay page hash: no dashes, no INV2 prefix. */
+export function payPageHash(id: string): string {
+  return id.replace(/-/g, "").replace(/^INV2/i, "");
+}
+
+/** True for a link that opens the customer pay page, never an api.sandbox.paypal.com API link. */
+function isCustomerPayLink(href: string): boolean {
+  return /^https:\/\/www\.(?:sandbox\.)?paypal\.com\/invoice\/p\//i.test(href);
+}
+
+/**
+ * The link that opens the customer pay page. It is the recipient view URL PayPal returns, or another customer pay
+ * link, or the pay page built from the invoice id. An API link is never returned.
+ */
+export function payUrlOf(raw: Record<string, unknown>, detail: Record<string, unknown>): string | null {
   const metadata = isObject(detail.metadata) ? detail.metadata : {};
   for (const key of ["recipient_view_url", "payer_view_url"]) {
     const value = metadata[key];
@@ -403,13 +419,14 @@ function payUrlOf(raw: Record<string, unknown>, detail: Record<string, unknown>)
   const links = Array.isArray(raw.links) ? raw.links : [];
   for (const rel of ["payer-view", "view"]) {
     for (const link of links) {
-      if (isObject(link) && link.rel === rel && typeof link.href === "string" && link.href) return link.href;
+      if (isObject(link) && link.rel === rel && typeof link.href === "string" && isCustomerPayLink(link.href)) return link.href;
     }
   }
   for (const link of links) {
-    if (isObject(link) && typeof link.href === "string" && /\/invoicing\/invoices\//.test(link.href)) return link.href;
+    if (isObject(link) && typeof link.href === "string" && isCustomerPayLink(link.href)) return link.href;
   }
-  return null;
+  const id = typeof raw.id === "string" ? raw.id : "";
+  return id ? PAYPAL_PAY_PAGE + payPageHash(id) : null;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

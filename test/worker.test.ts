@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 
 // A fake PayPal sandbox: records calls, keeps invoices by id, answers like the Invoicing v2 API.
-function fakePayPal(opts: { totalOverride?: string; qrFails?: boolean } = {}) {
+function fakePayPal(opts: { totalOverride?: string; qrFails?: boolean; payUrlAbsent?: boolean } = {}) {
   const calls: Array<{ method: string; path: string; body: unknown; headers: Record<string, string> }> = [];
   const invoices = new Map<string, Record<string, unknown>>();
   let n = 0;
@@ -16,7 +16,8 @@ function fakePayPal(opts: { totalOverride?: string; qrFails?: boolean } = {}) {
       const b = body as { detail: { invoice_number?: string }; items: Array<{ quantity: string; unit_amount: { value: string } }> };
       for (const inv of invoices.values()) if ((inv.detail as { invoice_number?: string }).invoice_number === b.detail.invoice_number) return Response.json({ name: "DUPLICATE_INVOICE_NUMBER", message: "dup" }, { status: 422 });
       const id = `INV2-${++n}`;
-      invoices.set(id, { id, detail: { ...b.detail, metadata: { recipient_view_url: `https://www.sandbox.paypal.com/invoice/p/#${id}` } }, amount: { value: opts.totalOverride ?? "", currency_code: "EUR" }, items: b.items, status: "DRAFT" });
+      const detail = opts.payUrlAbsent ? { ...b.detail } : { ...b.detail, metadata: { recipient_view_url: `https://www.sandbox.paypal.com/invoice/p/#${id}` } };
+      invoices.set(id, { id, detail, amount: { value: opts.totalOverride ?? "", currency_code: "EUR" }, items: b.items, status: "DRAFT" });
       return Response.json({ href: `https://api-m.sandbox.paypal.com/v2/invoicing/invoices/${id}` }, { status: 201 });
     }
     if (u.pathname === "/v2/invoicing/invoices" && (init?.method ?? "GET") === "GET") return Response.json({ items: [...invoices.values()] });
@@ -79,6 +80,14 @@ test("send: a QR failure after sending is a partial success, not an error", asyn
   assert.equal(r.status, 200);
   assert.equal(r.body.partial, true);
   assert.equal(r.body.qr, null);
+});
+
+test("send: the pay link falls back to the customer pay page, never an api link", async () => {
+  const pp = fakePayPal({ totalOverride: "106.41", payUrlAbsent: true });
+  const r = await call(envWith(pp), "/api/send", { draft, draftId: "PAYLINK123" });
+  assert.equal(r.status, 200);
+  assert.match(String(r.body.href), /^https:\/\/www\.sandbox\.paypal\.com\/invoice\/p\/#/);
+  assert.equal(String(r.body.href).includes("api.sandbox"), false);
 });
 
 test("send: no email means PayPal does not email anyone", async () => {

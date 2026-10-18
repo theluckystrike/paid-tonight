@@ -50,40 +50,77 @@ function percentTax(cents: bigint, thousandths: bigint): bigint {
   return (cents * thousandths + 50_000n) / 100_000n;
 }
 
-function orderedBySize(lines: bigint[]): number[] {
-  return lines
-    .map((_, i) => i)
-    .sort((a, b) => {
-      const la = lines[a]!;
-      const lb = lines[b]!;
-      if (la > lb) return -1;
-      if (la < lb) return 1;
-      return a - b;
-    });
+function gcd(a: bigint, b: bigint): bigint {
+  while (b > 0n) {
+    const t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+/** The whole-cent step a line's baked discount must be a multiple of, so the per-unit amount stays a whole cent. */
+function shareStep(qScaled: bigint): bigint {
+  if (qScaled <= 0n) return 0n;
+  return qScaled / gcd(qScaled, 1000n);
 }
 
 /**
- * Split an invoice discount across the lines in whole cents. Each line gets its floor share and the remainder goes to
- * the largest line, spilling to the next largest only if that line cannot hold it.
+ * Split a fixed discount so each line's share divides exactly by its quantity. The floor share of every line is
+ * rounded down to a whole step and the leftover cents go to a quantity 1 line when one exists, because a quantity 1
+ * line can hold any number of cents. A line can only give what its quantity times its unit amount holds, so the
+ * share never drives the reduced unit price below zero. Returns null when no split can use the whole discount, so
+ * PayPal takes it at invoice level instead.
  */
-function allocateDiscount(lines: bigint[], discount: bigint): bigint[] {
-  const allocated = lines.map(() => 0n);
+function allocateBakeable(lines: bigint[], qScaled: bigint[], unitCents: bigint[], discount: bigint): bigint[] | null {
   const subtotal = lines.reduce((a, b) => a + b, 0n);
-  if (discount <= 0n || subtotal <= 0n) return allocated;
-  for (let i = 0; i < lines.length; i++) allocated[i] = (lines[i]! * discount) / subtotal;
-  let remainder = discount - allocated.reduce((a, b) => a + b, 0n);
-  for (const i of orderedBySize(lines)) {
+  if (discount <= 0n) return lines.map(() => 0n);
+  if (subtotal <= 0n) return null;
+  const steps = qScaled.map((q) => shareStep(q));
+  // The most a line can give: floor(quantity times unit amount), so the reduced unit price is never negative.
+  const caps = qScaled.map((q, i) => (q > 0n ? (unitCents[i]! * q) / 1000n : 0n));
+  const shares = lines.map((line, i) => {
+    const step = steps[i]!;
+    if (step <= 0n) return 0n;
+    let base = (line * discount) / subtotal;
+    const cap = caps[i]!;
+    if (base > cap) base = cap;
+    return (base / step) * step;
+  });
+  let remainder = discount - shares.reduce((a, b) => a + b, 0n);
+  // Quantity 1 lines first (any remainder fits), then the rest in whole steps, largest line first.
+  const order = lines
+    .map((_, i) => i)
+    .sort((a, b) => {
+      const sa = steps[a] === 1n ? 0 : 1;
+      const sb = steps[b] === 1n ? 0 : 1;
+      if (sa !== sb) return sa - sb;
+      if (lines[a]! > lines[b]!) return -1;
+      if (lines[a]! < lines[b]!) return 1;
+      return a - b;
+    });
+  for (const i of order) {
     if (remainder <= 0n) break;
-    const room = lines[i]! - allocated[i]!;
-    const added = remainder < room ? remainder : room;
-    allocated[i] = allocated[i]! + added;
-    remainder -= added;
+    const step = steps[i]!;
+    if (step <= 0n) continue;
+    const room = caps[i]! - shares[i]!;
+    if (room < step) continue;
+    const units = room / step;
+    const wanted = remainder / step;
+    const k = units < wanted ? units : wanted;
+    shares[i] = shares[i]! + k * step;
+    remainder -= k * step;
   }
-  return allocated;
+  if (remainder !== 0n) return null;
+  return shares;
 }
 
 /** The warning shown when PayPal can only take the discount at invoice level, after tax. */
 export const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
+
+/** The warning shown when the draft carries both a fixed discount and a percentage discount that disagree. */
+export const BOTH_DISCOUNTS_WARNING = "Give either a discount amount or a discount percent, not both";
+
 
 interface DiscountPlan {
   lines: bigint[];
@@ -97,32 +134,87 @@ interface DiscountPlan {
   warning: string | null;
 }
 
+/** The percent a discount represents, scaled by 100 (so 0.5 is 50), or 0 when the subtotal is empty. */
+function effectiveHundredths(discount: bigint, subtotal: bigint): bigint {
+  if (subtotal <= 0n) return 0n;
+  return (discount * 10_000n + subtotal / 2n) / subtotal;
+}
+
+/** True when the effective discount is more than half a percentage point away from the stated percent. */
+function offByMoreThanHalfPoint(discount: bigint, subtotal: bigint, pct: bigint): boolean {
+  if (subtotal <= 0n) return false;
+  const effective = effectiveHundredths(discount, subtotal);
+  const diff = effective > pct ? effective - pct : pct - effective;
+  return diff > 50n;
+}
+
+/** The index of the largest quantity 1 line, or -1 when the draft has none. It can hold any leftover cents. */
+function largestSingleLine(lines: bigint[], qScaled: bigint[]): number {
+  let best = -1;
+  for (let i = 0; i < qScaled.length; i++) {
+    if (qScaled[i] !== 1000n) continue;
+    if (best < 0 || lines[i]! > lines[best]!) best = i;
+  }
+  return best;
+}
+
 /**
  * Work out how a draft's discount is applied. PayPal Invoicing v2 taxes an item before an item-level discount, so an
  * item.discount cannot give VAT after the discount. A discount is baked into the unit prices instead, which PayPal
- * taxes correctly. A percentage always bakes. A fixed amount bakes when every line's share divides exactly by its
- * quantity; otherwise PayPal takes it at invoice level, after tax, and the draft carries a warning.
+ * taxes correctly. A percentage bakes by reducing each unit price and taking the difference from the original line,
+ * the way PayPal rounds a line. A fixed amount bakes when its shares divide exactly by each quantity (the leftover
+ * cents go on a quantity 1 line); otherwise PayPal takes it at invoice level, after tax, and the draft warns.
  */
 function discountPlan(draft: InvoiceDraft): DiscountPlan {
   const qScaled = draft.items.map((item) => parseDecimal(item.quantity, 3));
   const unitCents = draft.items.map((item) => parseDecimal(item.unitAmount, 2));
   const lines = draft.items.map((item, i) => lineCentsFor(qScaled[i]!, unitCents[i]!));
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
   const percent = draft.discountPercent != null && draft.discountPercent !== "" ? draft.discountPercent : null;
   const fixed = draft.discount != null && draft.discount !== "" ? draft.discount : null;
 
+  if (percent != null && fixed != null) {
+    const pct = parseDecimal(percent, 2);
+    const share = (subtotal * pct + 5000n) / 10_000n;
+    if (parseDecimal(fixed, 2) !== share) {
+      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
+    }
+  }
   if (percent != null) {
-    const factor = 10_000n - parseDecimal(percent, 2);
+    const pct = parseDecimal(percent, 2);
+    const factor = 10_000n - pct;
     const reduced = unitCents.map((cents) => (cents * factor + 5000n) / 10_000n);
-    const lineDiscount = reduced.map((cents, i) => lineCentsFor(qScaled[i]!, unitCents[i]! - cents));
-    return { lines, unitCents: reduced, lineDiscount, totalDiscount: lineDiscount.reduce((a, b) => a + b, 0n), baked: true, percent, warning: null };
+    const reducedLines = reduced.map((cents, i) => lineCentsFor(qScaled[i]!, cents));
+    const lineDiscount = reducedLines.map((rl, i) => lines[i]! - rl);
+    const totalDiscount = lineDiscount.reduce((a, b) => a + b, 0n);
+    // Rounding a unit price can move the effective discount away from the stated percent on small amounts.
+    if (offByMoreThanHalfPoint(totalDiscount, subtotal, pct)) {
+      const target = (subtotal * pct + 5000n) / 10_000n;
+      const single = largestSingleLine(lines, qScaled);
+      if (single >= 0) {
+        // Keep the leftover cents on the quantity 1 line, whose unit price can hold any share.
+        const others = totalDiscount - lineDiscount[single]!;
+        let share = target - others;
+        if (share < 0n) share = 0n;
+        if (share > lines[single]!) share = lines[single]!;
+        const adjusted = lineDiscount.slice();
+        const adjustedUnits = reduced.slice();
+        adjusted[single] = share;
+        adjustedUnits[single] = unitCents[single]! - share;
+        const adjustedTotal = adjusted.reduce((a, b) => a + b, 0n);
+        if (!offByMoreThanHalfPoint(adjustedTotal, subtotal, pct)) {
+          return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, warning: null };
+        }
+      }
+      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, warning: INVOICE_DISCOUNT_WARNING };
+    }
+    return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, warning: null };
   }
   if (fixed != null) {
     const discount = parseDecimal(fixed, 2);
-    const subtotal = lines.reduce((a, b) => a + b, 0n);
     if (discount > subtotal) throw new Error("discount is larger than the subtotal");
-    const allocated = allocateDiscount(lines, discount);
-    const canBake = allocated.every((cents, i) => cents === 0n || (qScaled[i]! > 0n && (cents * 1000n) % qScaled[i]! === 0n));
-    if (canBake) {
+    const allocated = allocateBakeable(lines, qScaled, unitCents, discount);
+    if (allocated) {
       const reduced = allocated.map((cents, i) => unitCents[i]! - (qScaled[i]! > 0n ? (cents * 1000n) / qScaled[i]! : 0n));
       return { lines, unitCents: reduced, lineDiscount: allocated, totalDiscount: discount, baked: true, percent: null, warning: null };
     }

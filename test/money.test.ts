@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { INVOICE_DISCOUNT_WARNING, discountWarning, invoiceDiscount, totals, toPayPalItems } from "../src/money";
+import { INVOICE_DISCOUNT_WARNING, BOTH_DISCOUNTS_WARNING, discountWarning, invoiceDiscount, totals, toPayPalItems } from "../src/money";
 import type { InvoiceDraft } from "../src/types";
 
 function draft(overrides: Partial<InvoiceDraft> = {}): InvoiceDraft {
@@ -173,4 +173,55 @@ test("a 100 percent discount gives a 0.00 total", () => {
 test("toPayPalItems: a 3 decimal tax percent is sent as given", () => {
   const items = toPayPalItems(draft({ taxPercent: "8.875", items: [{ name: "Heater", quantity: "1", unitAmount: "1249.00" }] }));
   assert.deepEqual(items[0]?.tax, { name: "Tax", percent: "8.875" });
+});
+
+test("percent: the line discount is the original line minus round(quantity times reduced unit)", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [], discountPercent: "10",
+    items: [{ name: "Hours", quantity: "3.5", unitAmount: "65.50" }] };
+  assert.deepEqual(totals(d), { subtotal: "229.25", discount: "22.92", tax: "39.20", total: "245.53" });
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "58.95");
+});
+
+test("percent: 15 percent on four 0.05 lines keeps the remainder on a quantity 1 line, never 20 percent", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discountPercent: "15",
+    items: [0, 1, 2, 3].map((i) => ({ name: `Line ${i}`, quantity: "1", unitAmount: "0.05" })) };
+  assert.deepEqual(totals(d), { subtotal: "0.20", discount: "0.03", tax: "0.00", total: "0.17" });
+  assert.deepEqual(toPayPalItems(d).map((i) => i.unit_amount.value), ["0.05", "0.04", "0.04", "0.04"]);
+  assert.equal(invoiceDiscount(d), null);
+  assert.equal(discountWarning(d), null);
+});
+
+test("percent: on a line that cannot divide, per-unit rounding falls back to the invoice discount with a warning", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discountPercent: "15",
+    items: [{ name: "Bundle", quantity: "4", unitAmount: "0.05" }] };
+  assert.deepEqual(totals(d), { subtotal: "0.20", discount: "0.03", tax: "0.00", total: "0.17" });
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "0.05");
+  assert.deepEqual(invoiceDiscount(d), { amount: { currency_code: "EUR", value: "0.03" } });
+  assert.equal(discountWarning(d), INVOICE_DISCOUNT_WARNING);
+});
+
+test("both discounts: a fixed amount equal to the percent share is the same percent, no warning", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "20.00", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }] };
+  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" });
+  assert.equal(discountWarning(d), null);
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "180.00");
+});
+
+test("both discounts: a fixed amount that disagrees with the percent is refused with a warning, neither is dropped", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "10.00", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }] };
+  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "0.00", tax: "0.00", total: "200.00" });
+  assert.equal(discountWarning(d), BOTH_DISCOUNTS_WARNING);
+  assert.equal(invoiceDiscount(d), null);
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "200.00");
+});
+
+test("fixed: a share that cannot divide bakes by keeping the leftover cents on a quantity 1 line", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "10.00",
+    items: [{ name: "Hours", quantity: "3", unitAmount: "33.33" }, { name: "Callout", quantity: "1", unitAmount: "5.00" }] };
+  assert.deepEqual(totals(d), { subtotal: "104.99", discount: "10.00", tax: "0.00", total: "94.99" });
+  assert.deepEqual(toPayPalItems(d).map((i) => i.unit_amount.value), ["30.16", "4.51"]);
+  assert.equal(invoiceDiscount(d), null);
+  assert.equal(discountWarning(d), null);
 });

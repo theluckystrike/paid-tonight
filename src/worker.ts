@@ -1,7 +1,7 @@
 import { extractDraft } from "./extract.js";
 import { takeAiCall, type Counter } from "./limit.js";
 import { discountWarning, totals } from "./money.js";
-import { mapStatus, PAID_STATUSES, PaymentPendingError, PayPal, WEBHOOK_EVENTS } from "./paypal.js";
+import { mapStatus, PAID_STATUSES, PaymentPendingError, PayPal, payUrlOf, WEBHOOK_EVENTS } from "./paypal.js";
 import { draftReminder } from "./reminder.js";
 import { ExtractError, PayPalError, type AiRunner, type InvoiceDraft, type InvoiceStatus } from "./types.js";
 import { DraftInvalid, validateDraft } from "./validate.js";
@@ -29,7 +29,13 @@ const PAID_TODAY_PREFIX = "webhook:paid:";
 const NOT_OPEN = new Set([...PAID_STATUSES, "CANCELLED", "REFUNDED"]);
 
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-const today = () => new Date().toISOString().slice(0, 10);
+/** The local calendar day, so a payment made at 11pm sits under today, not tomorrow's UTC date. */
+function today(): string {
+  const d = new Date();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
 
 function aiRunner(env: Env): AiRunner {
   return async (messages) => {
@@ -51,7 +57,10 @@ function paypal(env: Env): PayPal {
 function fail(err: unknown): Response {
   if (err instanceof DraftInvalid) return Response.json({ error: "Check the draft: " + err.fields.join("; "), fields: err.fields }, { status: 422 });
   if (err instanceof ExtractError) return Response.json({ error: err.message }, { status: 422 });
-  if (err instanceof PayPalError) return Response.json({ error: `PayPal: ${err.message}`, debugId: err.debugId ?? null }, { status: err.status >= 400 && err.status < 600 ? err.status : 502 });
+  if (err instanceof PayPalError) {
+    const message = /^PayPal\b/.test(err.message) ? err.message : `PayPal says ${err.message}`;
+    return Response.json({ error: message, debugId: err.debugId ?? null }, { status: err.status >= 400 && err.status < 600 ? err.status : 502 });
+  }
   return Response.json({ error: "Something went wrong. Please try again." }, { status: 500 });
 }
 
@@ -137,11 +146,12 @@ function invoiceAmount(inv: unknown): { value: string; currency: string } {
 }
 
 function invoiceInfo(inv: unknown): { number: string; href: string | null; amount: { value: string; currency: string } | null } {
-  const d = (inv as { detail?: { invoice_number?: unknown; metadata?: { recipient_view_url?: unknown } } } | null)?.detail ?? {};
+  const raw = (inv && typeof inv === "object" ? inv : {}) as Record<string, unknown>;
+  const d = (raw.detail as { invoice_number?: unknown } | undefined) ?? {};
   const amount = invoiceAmount(inv);
   return {
     number: typeof d.invoice_number === "string" ? d.invoice_number : "",
-    href: typeof d.metadata?.recipient_view_url === "string" ? d.metadata.recipient_view_url : null,
+    href: payUrlOf(raw, (raw.detail as Record<string, unknown> | undefined) ?? {}),
     amount: amount.value ? amount : null,
   };
 }
@@ -230,7 +240,12 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
   let verified: boolean;
   try {
     verified = await paypal(env).verifyWebhook(event, webhookHeaders(req), env.PAYPAL_WEBHOOK_ID);
-  } catch {
+  } catch (err) {
+    // PayPal answered a bad request: the webhook itself is wrong, so refuse it instead of asking for a retry.
+    if (err instanceof PayPalError && err.status >= 400 && err.status < 500) {
+      webhookLog(type, eventId, "verify_failure");
+      return Response.json({ error: "Webhook signature did not verify." }, { status: 400 });
+    }
     // Verification itself failed (network, timeout, PayPal error): ask PayPal to send the event again later.
     webhookLog(type, eventId, "verify_error");
     return Response.json({ error: "The webhook could not be verified right now. PayPal will retry this event." }, { status: 503 });

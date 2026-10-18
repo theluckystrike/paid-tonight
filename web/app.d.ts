@@ -19,6 +19,15 @@ export function computeTotals(draft: {
   discountPercent?: string | null;
 }): BrowserTotals;
 
+export function computeWarnings(draft: {
+  items: Array<{ name?: string; quantity?: string; unitAmount?: string }>;
+  customerEmail?: string | null;
+  customerName?: string;
+  taxPercent?: string | null;
+  discount?: string | null;
+  discountPercent?: string | null;
+}): string[];
+
 export function reminderMailto(invoice: BrowserInvoice, subject: string, note: string): string;
 export function overdueLabel(invoice: BrowserInvoice, today?: string): { text: string; className: string };
 export function daysOverdue(invoice: BrowserInvoice, today?: string): number | null;

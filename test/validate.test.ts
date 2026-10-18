@@ -35,3 +35,14 @@ test("a 100 percent discount totals zero and is refused with a clear message", (
   assert.equal(totals({ ...free, taxPercent: "23" }).total, "0.00");
   assert.throws(() => validateDraft(free), (err: unknown) => err instanceof DraftInvalid && err.fields.some((f) => f.includes("0.00")));
 });
+
+test("a fixed discount and a percent that disagree is refused with a clear warning", () => {
+  const both = { ...base, discount: "10.00", discountPercent: "10", items: [{ name: "Work", quantity: "1", unitAmount: "200.00" }] };
+  assert.throws(() => validateDraft(both), (err: unknown) => err instanceof DraftInvalid && err.fields.some((f) => f.includes("not both")));
+});
+
+test("a fixed discount that matches the percent share is accepted", () => {
+  const both = { ...base, discount: "20.00", discountPercent: "10", items: [{ name: "Work", quantity: "1", unitAmount: "200.00" }] };
+  const draft = validateDraft(both);
+  assert.equal(totals(draft).total, "180.00");
+});
