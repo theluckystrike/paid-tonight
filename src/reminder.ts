@@ -14,6 +14,8 @@ Rules:
 - The note refers to the work the customer already received and the amount they owe, and tells them to use the payment link in the email.
 - Match the requested tone. A "friendly" reminder is warm and light; a "firm" reminder is direct but still respectful.
 - No threats, no mention of legal action or collections, no emojis, no ALL CAPS.
+- Only call the invoice overdue when "Days overdue" is a number above 0. Otherwise say it is due now.
+- Write like a person, not a template. No opener like "We hope you're enjoying", no colons, no dashes, no semicolons.
 - The subject must contain the invoice number.`;
 
 interface ParsedReminder {
