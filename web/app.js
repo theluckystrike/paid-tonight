@@ -42,22 +42,88 @@ function lineTotalCents(item) {
   return roundHalfUp(num, den);
 }
 
-// Same rule as the server (src/money.ts) and PayPal: tax per line on the full line amount, each rounded half-up,
-// and the invoice discount subtracted after tax. The server re-checks PayPal's own total before anything is sent.
-function percentBps(value) {
-  const p = parseDecimal(value); // "23" -> 2300, "8.5" -> 850: percent in hundredths, rounded half-up like the server
-  return roundHalfUp(p.coeff * 100n, 10n ** BigInt(p.scale));
+// Same rule as the server (src/money.ts) and PayPal: a percentage discount (and a fixed one that divides exactly by
+// each quantity) is baked into the unit prices, so tax is charged per line on the discounted amount, rounded half-up.
+// A fixed discount that cannot be baked is taken by PayPal at invoice level, after tax, with a warning. The server
+// re-checks PayPal's own total.
+function scaledDecimal(raw, scale) {
+  const p = parseDecimal(raw);
+  return roundHalfUp(p.coeff * (10n ** BigInt(scale)), 10n ** BigInt(p.scale));
+}
+
+function percentThousandths(value) {
+  return scaledDecimal(value, 3); // "8.875" -> 8875: percent scaled by 1000, rounded half-up like the server
+}
+
+function lineCentsFor(qScaled, unitCents) {
+  return (qScaled * unitCents + 500n) / 1000n;
+}
+
+const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
+
+function orderedBySize(lines) {
+  return lines
+    .map((_, i) => i)
+    .sort((a, b) => {
+      if (lines[a] > lines[b]) return -1;
+      if (lines[a] < lines[b]) return 1;
+      return a - b;
+    });
+}
+
+function allocateDiscount(lines, discount) {
+  const allocated = lines.map(() => 0n);
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  if (discount <= 0n || subtotal <= 0n) return allocated;
+  for (let i = 0; i < lines.length; i += 1) allocated[i] = (lines[i] * discount) / subtotal;
+  let remainder = discount - allocated.reduce((a, b) => a + b, 0n);
+  for (const i of orderedBySize(lines)) {
+    if (remainder <= 0n) break;
+    const room = lines[i] - allocated[i];
+    const added = remainder < room ? remainder : room;
+    allocated[i] += added;
+    remainder -= added;
+  }
+  return allocated;
+}
+
+function discountPlan(draft) {
+  const qScaled = draft.items.map((item) => scaledDecimal(item.quantity, 3));
+  const unitCents = draft.items.map((item) => scaledDecimal(item.unitAmount, 2));
+  const lines = draft.items.map((item, i) => lineCentsFor(qScaled[i], unitCents[i]));
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "" ? String(draft.discountPercent).trim() : null;
+  const fixed = draft.discount != null && String(draft.discount).trim() !== "" ? String(draft.discount).trim() : null;
+  if (percent != null) {
+    const factor = 10000n - scaledDecimal(percent, 2);
+    const reduced = unitCents.map((cents) => (cents * factor + 5000n) / 10000n);
+    const lineDiscount = reduced.map((cents, i) => lineCentsFor(qScaled[i], unitCents[i] - cents));
+    return { lines, unitCents: reduced, lineDiscount, totalDiscount: lineDiscount.reduce((a, b) => a + b, 0n), baked: true, percent, warning: null };
+  }
+  if (fixed != null) {
+    let discount = scaledDecimal(fixed, 2);
+    if (discount > subtotal) discount = subtotal;
+    const allocated = allocateDiscount(lines, discount);
+    const canBake = allocated.every((cents, i) => cents === 0n || (qScaled[i] > 0n && (cents * 1000n) % qScaled[i] === 0n));
+    if (canBake) {
+      const reduced = allocated.map((cents, i) => unitCents[i] - (qScaled[i] > 0n ? (cents * 1000n) / qScaled[i] : 0n));
+      return { lines, unitCents: reduced, lineDiscount: allocated, totalDiscount: discount, baked: true, percent: null, warning: null };
+    }
+    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: discount, baked: false, percent: null, warning: INVOICE_DISCOUNT_WARNING };
+  }
+  return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: null };
 }
 
 function computeTotals(draft) {
-  const lines = draft.items.map(lineTotalCents);
-  const subtotal = lines.reduce((a, b) => a + b, 0n);
-  const d = parseDecimal(draft.discount);
-  let discount = roundHalfUp(d.coeff * 100n, 10n ** BigInt(d.scale));
-  if (discount > subtotal) discount = subtotal;
-  const bps = draft.taxPercent == null ? 0n : percentBps(draft.taxPercent);
-  const tax = lines.reduce((a, c) => a + roundHalfUp(c * bps, 10000n), 0n); // PayPal: tax on full lines, discount after tax
-  return { subtotal: centsToStr(subtotal), discount: centsToStr(discount), tax: centsToStr(tax), total: centsToStr(subtotal + tax - discount) };
+  const plan = discountPlan(draft);
+  const subtotal = plan.lines.reduce((a, b) => a + b, 0n);
+  const thousandths = draft.taxPercent == null ? 0n : percentThousandths(draft.taxPercent);
+  let tax = 0n;
+  for (let i = 0; i < plan.lines.length; i += 1) {
+    const base = plan.baked ? plan.lines[i] - plan.lineDiscount[i] : plan.lines[i];
+    tax += roundHalfUp(base * thousandths, 100000n);
+  }
+  return { subtotal: centsToStr(subtotal), discount: centsToStr(plan.totalDiscount), tax: centsToStr(tax), total: centsToStr(subtotal - plan.totalDiscount + tax) };
 }
 
 function newDraftId() {
@@ -105,15 +171,21 @@ function formatMoney(amount, currency) {
   }
 }
 
-function daysOverdue(invoice, today) {
+function calendarDaysPastDue(invoice, today) {
   const dateStr = invoice && (invoice.dueDate || invoice.invoiceDate);
   if (!dateStr) return null;
   const due = Date.parse(String(dateStr));
   if (Number.isNaN(due)) return null;
   const ref = today ? Date.parse(String(today)) : Date.now();
   const base = Number.isNaN(ref) ? Date.now() : ref;
+  return Math.floor((base - due) / 86400000);
+}
+
+function daysOverdue(invoice, today) {
+  const past = calendarDaysPastDue(invoice, today);
+  if (past == null) return null;
   // Same rule as the server: one day of grace, because PayPal sets the due date in the seller's time zone.
-  return Math.max(0, Math.floor((base - due) / 86400000) - 1);
+  return Math.max(0, past - 1);
 }
 
 function qrDataUrl(qr) {
@@ -125,6 +197,13 @@ function qrDataUrl(qr) {
 function safeHref(value) {
   const text = String(value || "");
   return /^https?:\/\//i.test(text) ? text : "";
+}
+
+function reminderMailto(invoice, subject, note) {
+  if (!invoice || !invoice.customerEmail) return "";
+  const payUrl = safeHref(invoice.payUrl);
+  const body = [String(note || "").trim(), payUrl ? `Pay online at ${payUrl}` : ""].filter(Boolean).join("\n\n");
+  return "mailto:" + encodeURIComponent(invoice.customerEmail) + "?subject=" + encodeURIComponent(String(subject || "").trim()) + "&body=" + encodeURIComponent(body);
 }
 
 function asText(value, fallback) {
@@ -164,6 +243,7 @@ function normalizeDraft(data) {
     items: Array.isArray(raw.items) ? raw.items.map(normalizeItem).filter(Boolean) : [],
     taxPercent: raw.taxPercent == null || raw.taxPercent === "" ? null : String(raw.taxPercent),
     discount: raw.discount == null || raw.discount === "" ? null : moneyText(raw.discount),
+    discountPercent: raw.discountPercent == null || raw.discountPercent === "" ? null : decimalText(raw.discountPercent, "0"),
     note: raw.note == null || raw.note === "" ? null : String(raw.note),
     warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String).slice(0, 20) : [],
   };
@@ -180,9 +260,11 @@ function normalizeUnpaid(raw) {
     customerName: asText(raw.customerName, "Customer"),
     customerEmail: raw.customerEmail ? asText(raw.customerEmail, "") : null,
     total: moneyText(raw.total),
+    dueAmount: raw.dueAmount == null || raw.dueAmount === "" ? null : moneyText(raw.dueAmount),
     currency: currencyOf(raw.currency),
     dueDate: raw.dueDate ? asText(raw.dueDate, "") : null,
     invoiceDate: raw.invoiceDate ? asText(raw.invoiceDate, "") : null,
+    payUrl: safeHref(raw.payUrl) || null,
   };
 }
 
@@ -285,6 +367,8 @@ function friendlyMessage(err) {
 
 function computeWarnings(draft) {
   const warnings = [];
+  const plan = discountPlan(draft);
+  if (plan.warning) warnings.push(plan.warning);
   if (!draft.customerEmail) warnings.push("No customer email. The customer can pay by scanning the QR code.");
   if (!draft.customerName || !draft.customerName.trim()) warnings.push("No customer name.");
   for (const item of draft.items) {
@@ -307,11 +391,12 @@ function dedupeWarnings(serverWarnings, localWarnings) {
   return out;
 }
 
-function overdueLabel(invoice) {
-  const days = daysOverdue(invoice);
-  if (days == null) return { text: "No due date", className: "muted" };
-  if (days === 0) return { text: "Due today", className: "muted" };
-  return { text: `Overdue ${days} day${days === 1 ? "" : "s"}`, className: "danger" };
+function overdueLabel(invoice, today) {
+  const past = calendarDaysPastDue(invoice, today);
+  if (past == null) return { text: "No due date", className: "muted" };
+  if (past === 0) return { text: "Due today", className: "muted" };
+  if (past < 0) return { text: `Due in ${-past} day${past === -1 ? "" : "s"}`, className: "muted" };
+  return { text: `Overdue ${past} day${past === 1 ? "" : "s"}`, className: "danger" };
 }
 
 function el(tag, className, text) {
@@ -329,8 +414,8 @@ function makeInput(type, value, label) {
   return input;
 }
 
-function actionsEl(buttons) {
-  const wrap = el("div", "actions");
+function actionsEl(buttons, className) {
+  const wrap = el("div", className || "actions");
   for (const b of buttons) wrap.append(b);
   return wrap;
 }
@@ -592,11 +677,24 @@ function unpaidRow(ui, invoice) {
   const bottom = el("div", "unpaid-row__bottom");
   const lbl = overdueLabel(invoice);
   bottom.append(el("span", `unpaid-row__status unpaid-row__status--${lbl.className}`, lbl.text));
+  const payUrl = safeHref(invoice.payUrl);
+  if (payUrl) {
+    const link = document.createElement("a");
+    link.className = "link unpaid-row__pay";
+    link.href = payUrl;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "Pay link";
+    bottom.append(link);
+  }
   const btn = el("button", "btn btn--small", "Draft reminder");
   btn.type = "button";
   btn.addEventListener("click", () => handleDraftReminder(ui, invoice, btn));
   bottom.append(btn);
   row.append(top, bottom);
+  if (invoice.status === "PARTIALLY_PAID" && invoice.dueAmount) {
+    row.append(el("p", "unpaid-row__due", `Still due ${formatMoney(invoice.dueAmount, invoice.currency)} of ${formatMoney(invoice.total, invoice.currency)}`));
+  }
   return row;
 }
 
@@ -665,7 +763,7 @@ function buildReminderEditor(ui, invoice, reminder) {
     el("label", "field-label", "Subject"), subject,
     el("label", "field-label", "Message"), note,
     errorBox,
-    actionsEl([backBtn, copyBtn, emailBtn, sendBtn]),
+    actionsEl([backBtn, copyBtn, emailBtn, sendBtn], "actions actions--reminder"),
   );
 
   copyBtn.addEventListener("click", async () => {
@@ -673,8 +771,7 @@ function buildReminderEditor(ui, invoice, reminder) {
   });
   emailBtn.addEventListener("click", () => {
     if (!invoice.customerEmail) { showError(errorBox, "This invoice has no customer email."); return; }
-    const url = "mailto:" + encodeURIComponent(invoice.customerEmail) + "?subject=" + encodeURIComponent(subject.value.trim()) + "&body=" + encodeURIComponent(note.value.trim());
-    window.location.href = url;
+    window.location.href = reminderMailto(invoice, subject.value, note.value);
   });
   sendBtn.addEventListener("click", async () => {
     sendBtn.disabled = true;
@@ -812,8 +909,10 @@ export {
   moneyText,
   formatMoney,
   daysOverdue,
+  calendarDaysPastDue,
   qrDataUrl,
   safeHref,
+  reminderMailto,
   asText,
   currencyOf,
   normalizeItem,

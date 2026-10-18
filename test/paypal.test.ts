@@ -240,8 +240,8 @@ test("listUnpaid: filters statuses and maps fields", async () => {
   assert.equal(list.length, 3);
   assert.deepEqual(list[0], {
     id: "INV-1", number: "0001", status: "SENT", customerName: "Anna Kowalski",
-    customerEmail: "anna@example.com", total: "221.39", currency: "USD",
-    dueDate: "2026-10-17", invoiceDate: "2026-10-17",
+    customerEmail: "anna@example.com", total: "221.39", dueAmount: "221.39", currency: "USD",
+    dueDate: "2026-10-17", invoiceDate: "2026-10-17", payUrl: null,
   });
   assert.equal(list[1]?.number, "0002");
   assert.equal(list[1]?.customerEmail, null);
@@ -335,4 +335,164 @@ test("unpaid list reads the customer name when PayPal splits it into given_name 
   const row = mapInvoice({ id: "INV2-X", status: "SENT", detail: { invoice_number: "PT-1" }, amount: { value: "10.00", currency_code: "EUR" },
     primary_recipients: [{ billing_info: { name: { given_name: "Ola", surname: "Nowak" }, email_address: "ola@example.com" } }] });
   assert.equal(row?.customerName, "Ola Nowak");
+});
+
+function unpaidItem(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id, status: "SENT",
+    detail: { invoice_number: id, invoice_date: "2026-10-17", due_date: "2026-10-17" },
+    amount: { currency_code: "USD", value: "10.00" },
+    primary_recipients: [],
+    ...extra,
+  };
+}
+
+test("R5: listUnpaid pages past the first 50 invoices", async () => {
+  const page1 = Array.from({ length: 50 }, (_, i) => unpaidItem(`INV-A${i}`));
+  const page2 = [unpaidItem("INV-B1"), unpaidItem("INV-B2")];
+  const { fetch, calls } = makeFetch((req) => {
+    if (req.path === "/v1/oauth2/token") return tokenResponse();
+    return json({ items: req.search.includes("page=1") ? page1 : page2 });
+  });
+  const pp = new PayPal("cid", "sec", fetch);
+  const list = await pp.listUnpaid();
+  assert.equal(list.length, 52);
+  const listCalls = calls.filter((c) => c.path === "/v2/invoicing/invoices");
+  assert.equal(listCalls.length, 2);
+  assert.match(listCalls[0]!.search, /page=1/);
+  assert.match(listCalls[1]!.search, /page=2/);
+  assert.equal(list[51]?.id, "INV-B2");
+});
+
+test("R5: a PARTIALLY_PAID invoice exposes its due_amount", async () => {
+  const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ items: [
+    unpaidItem("INV-P1", { status: "PARTIALLY_PAID", amount: { currency_code: "EUR", value: "100.00" }, due_amount: { currency_code: "EUR", value: "40.00" } }),
+  ] }));
+  const pp = new PayPal("cid", "sec", fetch);
+  const list = await pp.listUnpaid();
+  assert.equal(list[0]?.total, "100.00");
+  assert.equal(list[0]?.dueAmount, "40.00");
+});
+
+test("R5: the unpaid invoice carries the recipient view link or a PayPal invoice link", async () => {
+  const { fetch } = makeFetch((req) => req.path === "/v1/oauth2/token" ? tokenResponse() : json({ items: [
+    unpaidItem("INV-L1", { detail: { invoice_number: "L1", metadata: { recipient_view_url: "https://www.sandbox.paypal.com/invoice/p/#L1" } } }),
+    unpaidItem("INV-L2", { links: [{ rel: "payer-view", href: "https://www.sandbox.paypal.com/invoice/p/#L2" }] }),
+  ] }));
+  const pp = new PayPal("cid", "sec", fetch);
+  const list = await pp.listUnpaid();
+  assert.equal(list[0]?.payUrl, "https://www.sandbox.paypal.com/invoice/p/#L1");
+  assert.equal(list[1]?.payUrl, "https://www.sandbox.paypal.com/invoice/p/#L2");
+});
+
+test("R4: createDraft strips honorifics before splitting the name", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-NAME" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({ customerName: "Herrn Thomas Müller", items: [{ name: "Work", quantity: "1", unitAmount: "10.00" }] }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.deepEqual(body.primary_recipients[0].billing_info.name, { full_name: "Thomas Müller", given_name: "Thomas", surname: "Müller" });
+});
+
+test("R2: createDraft bakes a fixed discount into the unit prices and sends no discount object", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-DISC" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({
+    currency: "EUR", taxPercent: "23", discount: "13.00",
+    items: [{ name: "Labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }],
+  }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.equal(body.amount, undefined);
+  assert.equal("discount" in body.items[0], false);
+  assert.equal("discount" in body.items[1], false);
+  assert.equal(body.items[0].unit_amount.value, "45.00");
+  assert.equal(body.items[1].unit_amount.value, "27.00");
+  assert.equal(body.items[0].tax.percent, "23");
+});
+
+test("R2: createDraft sends an invoice-level discount when a fixed amount cannot split exactly", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-INVDISC" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({
+    currency: "EUR", taxPercent: "23", discount: "10.00",
+    items: [{ name: "Hours", quantity: "3", unitAmount: "33.33" }],
+  }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.equal(body.items[0].unit_amount.value, "33.33");
+  assert.equal("discount" in body.items[0], false);
+  assert.deepEqual(body.amount, { currency_code: "EUR", breakdown: { discount: { invoice_discount: { amount: { currency_code: "EUR", value: "10.00" } } } } });
+});
+
+test("R2: the fallback invoice discount is sent as invoice_discount.amount and no item carries a discount", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-FB" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({
+    currency: "USD", taxPercent: "10", discount: "10.00",
+    items: [{ name: "Hours", quantity: "3", unitAmount: "33.33" }],
+  }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.deepEqual(body.amount, { currency_code: "USD", breakdown: { discount: { invoice_discount: { amount: { currency_code: "USD", value: "10.00" } } } } });
+  assert.equal(body.amount.breakdown.discount.invoice_discount.amount.value, "10.00");
+  assert.equal(body.items[0].unit_amount.value, "33.33");
+  for (const item of body.items) assert.equal("discount" in item, false);
+});
+
+test("R2: the baked cases carry no invoice_discount", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-BAKED" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({
+    currency: "EUR", taxPercent: "23", discount: "13.00",
+    items: [{ name: "Labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }],
+  }), { businessName: "B" });
+  const baked = JSON.parse(calls.find((c) => c.path === "/v2/invoicing/invoices")?.body ?? "{}");
+  assert.equal("amount" in baked, false);
+  calls.length = 0;
+  await pp.createDraft(baseDraft({
+    currency: "EUR", taxPercent: "23", discountPercent: "10",
+    items: [{ name: "Labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }],
+  }), { businessName: "B" });
+  const percent = JSON.parse(calls.find((c) => c.path === "/v2/invoicing/invoices")?.body ?? "{}");
+  assert.equal("amount" in percent, false);
+});
+
+test("R2: createDraft bakes a percentage discount into the unit prices and labels the line", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-PCT" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({
+    currency: "EUR", taxPercent: "23", discountPercent: "10",
+    items: [{ name: "Labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }],
+  }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.equal(body.amount, undefined);
+  assert.equal(body.items[0].unit_amount.value, "45.00");
+  assert.equal(body.items[1].unit_amount.value, "27.00");
+  assert.equal(body.items[0].description, "10% off included");
+  assert.equal("discount" in body.items[0], false);
+});
+
+test("R3: createDraft sends a 3 decimal tax percent as a string", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-TAX" }, 201),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.createDraft(baseDraft({ currency: "USD", taxPercent: "8.875", items: [{ name: "Heater", quantity: "1", unitAmount: "1249.00" }] }), { businessName: "B" });
+  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
+  const body = JSON.parse(create?.body ?? "{}");
+  assert.equal(body.items[0].tax.percent, "8.875");
 });

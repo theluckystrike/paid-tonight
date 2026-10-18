@@ -233,3 +233,119 @@ test("R6: an item with 'reduction' in its name is an item, and '10 percent off' 
     { name: "Labour", quantity: "2", unitAmount: "50", unit: "HOURS" }, { name: "Valve", quantity: "1", unitAmount: "30" }] })), TODAY);
   assert.equal(pct.discount, "13.00");
 });
+
+test("R8: percentage discounts are a share of the subtotal in German and Spanish", async () => {
+  const german = "3 Std. à 65,50 €, 19 % MwSt., 10 % Rabatt";
+  const d1 = await extractDraft(german, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null,
+    items: [{ name: "Arbeit", quantity: "3", unitAmount: "65.50", unit: "HOURS" }] })), TODAY);
+  assert.equal(d1.discount, "19.65");
+  assert.equal(d1.discountPercent, "10");
+  const d2 = await extractDraft(german, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null,
+    items: [{ name: "Arbeit", quantity: "3", unitAmount: "65.50", unit: "HOURS" }, { name: "Anfahrt", quantity: "1", unitAmount: "24.90" }] })), TODAY);
+  assert.equal(d2.discount, "22.14");
+  assert.notEqual(d2.discount, "10.00");
+  const spanish = "1.250,00 €, 6 horas a 45 €, descuento del 15 %, IVA 21 %";
+  const d3 = await extractDraft(spanish, aiOnce(draftJson({ currency: "EUR", taxPercent: "21", discount: null,
+    items: [{ name: "Materiales", quantity: "1", unitAmount: "1250.00" }, { name: "Trabajo", quantity: "6", unitAmount: "45", unit: "HOURS" }] })), TODAY);
+  assert.equal(d3.discount, "228.00");
+  assert.equal(d3.discountPercent, "15");
+});
+
+test("R8: every required discount phrase is recognised", async () => {
+  const phrases: Array<[string, string]> = [
+    ["10 % Rabatt", "20.00"], ["descuento del 15 %", "30.00"], ["remise de 10 %", "20.00"],
+    ["sconto 10%", "20.00"], ["korting 10%", "20.00"], ["rabat 10%", "20.00"],
+    ["10% off", "20.00"], ["sleva 10 %", "20.00"], ["alennus 10 %", "20.00"],
+  ];
+  for (const [text, discount] of phrases) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ discount: null,
+      items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discount, discount, text);
+  }
+});
+
+test("R8: an applied percent that differs from the text is visible as a warning", async () => {
+  const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: null, discountPercent: "5",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discount, "10.00");
+  assert.ok(draft.warnings.some((w) => w.includes("not 10% of the subtotal")), draft.warnings.join(" | "));
+});
+
+test("R8: the prompt asks for discountPercent and tax with up to 3 decimals", async () => {
+  let seen: Messages = [];
+  const ai: AiRunner = async (messages) => { seen = messages; return draftJson(); };
+  await extractDraft("job", ai, TODAY);
+  const joined = seen.map((m) => m.content).join("\n");
+  assert.match(joined, /discountPercent/);
+  assert.match(joined, /3 decimals/);
+});
+
+test("R8: discountPercent above 100 or with more than 2 decimals is rejected", async () => {
+  await assert.rejects(extractDraft("job", aiOnce(draftJson({ discountPercent: "101" })), TODAY), ExtractError);
+  await assert.rejects(extractDraft("job", aiOnce(draftJson({ discountPercent: "10.123" })), TODAY), ExtractError);
+});
+
+test("R8: a percent returned as both a percent and the same computed amount is counted once", async () => {
+  const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: "20.00", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discount, "20.00");
+});
+
+test("R9: a European thousands amount reaches the draft as 1250.00, not 1.25", async () => {
+  const text = "Reparación para la Sra. García, material 1.250,00 €, 6 horas a 45 €, descuento del 15 %, IVA 21 %";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "21", discount: null, discountPercent: "15",
+    items: [{ name: "Material", quantity: "1", unitAmount: "1.25" }, { name: "Mano de obra", quantity: "6", unitAmount: "45", unit: "HOURS" }] })), TODAY);
+  assert.deepEqual(draft.items[0], { name: "Material", quantity: "1", unitAmount: "1250.00" });
+  assert.equal(draft.items[1]!.unitAmount, "45.00");
+  assert.ok(draft.warnings.some((w) => w.includes('Corrected "Material" from 1.25 to 1250.00')), draft.warnings.join(" | "));
+  assert.equal(draft.discount, "228.00");
+  assert.equal(draft.discountPercent, "15");
+});
+
+test("R9: a European number copied verbatim is normalised instead of rejected", async () => {
+  const text = "Reparación para la Sra. García, material 1.250,00 €, 6 horas a 45 €, descuento del 15 %, IVA 21 %";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "21", discount: null, discountPercent: "15",
+    items: [{ name: "Material", quantity: "1", unitAmount: "1.250,00" }, { name: "Mano de obra", quantity: "6", unitAmount: "45", unit: "HOURS" }] })), TODAY);
+  assert.equal(draft.items[0]!.unitAmount, "1250.00");
+  assert.ok(!draft.warnings.some((w) => w.includes("Corrected")), draft.warnings.join(" | "));
+  assert.equal(draft.discount, "228.00");
+});
+
+test("R9: an amount that is not in the description is flagged (German boiler job)", async () => {
+  const text = "Kessel bei Herrn Weber, 3 Std. à 65,50 €, Dichtung 25,00 €, 19 % MwSt., 10 % Rabatt";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null, discountPercent: "10",
+    items: [{ name: "Kessel gewartet", quantity: "3", unitAmount: "65,50", unit: "HOURS" }, { name: "Dichtung", quantity: "1", unitAmount: "1.25" }] })), TODAY);
+  assert.equal(draft.items[0]!.unitAmount, "65.50");
+  assert.equal(draft.items[1]!.unitAmount, "1.25");
+  assert.ok(draft.warnings.some((w) => w.includes('"Dichtung" at 1.25 is not in the description; check it')), draft.warnings.join(" | "));
+  assert.ok(!draft.warnings.some((w) => w.includes("Corrected")), draft.warnings.join(" | "));
+});
+
+test("R9: every European money format in the description is read correctly", async () => {
+  const cases: Array<[string, string, string]> = [
+    ["material 1.250,00 €", "1.25", "1250.00"],
+    ["material 12.345,67 €", "12345.67", "12345.67"],
+    ["material 1.250 €", "1.25", "1250.00"],
+    ["material 1 250,50 €", "1250.50", "1250.50"],
+    ["material 1'250.00", "1.25", "1250.00"],
+  ];
+  for (const [text, fromModel, expected] of cases) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: null,
+      items: [{ name: "Material", quantity: "1", unitAmount: fromModel }] })), TODAY);
+    assert.equal(draft.items[0]!.unitAmount, expected, text);
+    assert.ok(!draft.warnings.some((w) => w.includes("is not in the description")), `${text}: ${draft.warnings.join(" | ")}`);
+  }
+});
+
+test("R9: the prompt keeps item names and the note in the description's language", async () => {
+  let seen: Messages = [];
+  const ai: AiRunner = async (messages) => { seen = messages; return draftJson(); };
+  await extractDraft("Kessel gewartet für Herrn Weber", ai, TODAY);
+  const system = seen[0]!.content;
+  assert.match(system, /same language as the job description/);
+  assert.match(system, /Never translate item names into English/);
+  assert.match(system, /The note stays in the language of the job description/);
+  assert.match(system, /1\.250,00/);
+  assert.match(system, /1 250,50/);
+  assert.match(system, /1'250\.00/);
+});

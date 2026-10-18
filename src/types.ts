@@ -7,8 +7,10 @@ export interface InvoiceDraft {
   currency: string;
   items: LineItem[];
   taxPercent: string | null;
-  /** Invoice-level discount, a positive amount subtracted after tax (PayPal's rule). */
+  /** Invoice discount, a positive amount spread across the lines before tax. */
   discount?: string | null;
+  /** Discount as a percentage of the subtotal, 0 to 100 with up to 2 decimals. */
+  discountPercent?: string | null;
   note: string | null;
   warnings: string[];
 }
@@ -17,7 +19,8 @@ export interface Totals { subtotal: string; discount: string; tax: string; total
 
 export interface UnpaidInvoice {
   id: string; number: string; status: string; customerName: string; customerEmail: string | null;
-  total: string; currency: string; dueDate: string | null; invoiceDate: string | null;
+  total: string; dueAmount: string | null; currency: string; dueDate: string | null; invoiceDate: string | null;
+  payUrl: string | null;
 }
 
 export class PayPalError extends Error {

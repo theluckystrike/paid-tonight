@@ -1,6 +1,7 @@
 import { PayPalError } from "./types";
 import type { InvoiceDraft, UnpaidInvoice } from "./types";
-import { toPayPalItems } from "./money";
+import { invoiceDiscount, toPayPalItems } from "./money";
+import { splitCustomerName } from "./names";
 
 const DEFAULT_BASE = "https://api-m.sandbox.paypal.com";
 const TIMEOUT_MS = 8000;
@@ -45,9 +46,9 @@ export class PayPal {
     if (invoiceNumber) detail.invoice_number = invoiceNumber;
     if (draft.note != null) detail.note = draft.note;
     // The sandbox keeps given_name and surname but drops a lone full_name, so send both forms.
-    const parts = draft.customerName.trim().split(/\s+/);
-    const name: Record<string, string> = { full_name: draft.customerName, given_name: parts[0] ?? "" };
-    if (parts.length > 1) name.surname = parts.slice(1).join(" ");
+    const parts = splitCustomerName(draft.customerName);
+    const name: Record<string, string> = { full_name: parts.fullName, given_name: parts.givenName };
+    if (parts.surname) name.surname = parts.surname;
     const billing: Record<string, unknown> = { name };
     if (draft.customerEmail != null) billing.email_address = draft.customerEmail;
     const payload: Record<string, unknown> = {
@@ -56,9 +57,9 @@ export class PayPal {
       primary_recipients: [{ billing_info: billing }],
       items: toPayPalItems(draft),
     };
-    if (draft.discount && draft.discount !== "0.00") {
-      payload.amount = { breakdown: { discount: { invoice_discount: { amount: { currency_code: draft.currency, value: draft.discount } } } } };
-    }
+    // Only a fixed discount that will not divide exactly by each quantity is sent at invoice level, after tax.
+    const invDiscount = invoiceDiscount(draft);
+    if (invDiscount) payload.amount = { currency_code: draft.currency, breakdown: { discount: { invoice_discount: invDiscount } } };
     const res = await this.request("POST", "/v2/invoicing/invoices", {
       body: JSON.stringify(payload),
       contentType: "application/json",
@@ -96,14 +97,18 @@ export class PayPal {
   }
 
   async listUnpaid(): Promise<UnpaidInvoice[]> {
-    const res = await this.request("GET", "/v2/invoicing/invoices?page=1&page_size=50&total_required=true");
-    const data = await res.json();
-    const items = Array.isArray(data.items) ? data.items : [];
     const keep = new Set(["SENT", "UNPAID", "PARTIALLY_PAID"]);
     const out: UnpaidInvoice[] = [];
-    for (const raw of items) {
-      const mapped = mapInvoice(raw);
-      if (mapped && keep.has(mapped.status)) out.push(mapped);
+    for (let page = 1; page <= 20; page++) {
+      const res = await this.request("GET", `/v2/invoicing/invoices?page=${page}&page_size=50&total_required=true`);
+      const data = await res.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      for (const raw of items) {
+        const mapped = mapInvoice(raw);
+        if (mapped && keep.has(mapped.status)) out.push(mapped);
+      }
+      const totalPages = Number(data.total_pages);
+      if (Number.isFinite(totalPages) && totalPages > 0 ? page >= totalPages : items.length < 50) break;
     }
     return out;
   }
@@ -213,17 +218,46 @@ export function mapInvoice(raw: unknown): UnpaidInvoice | null {
     if (!customerName && typeof billing.business_name === "string") customerName = billing.business_name;
     if (typeof billing.email_address === "string" && billing.email_address !== "") customerEmail = billing.email_address;
   }
+  const status = typeof raw.status === "string" ? raw.status : "";
+  const total = typeof amount.value === "string" ? amount.value : "0.00";
   return {
     id,
     number: typeof detail.invoice_number === "string" ? detail.invoice_number : "",
-    status: typeof raw.status === "string" ? raw.status : "",
+    status,
     customerName,
     customerEmail,
-    total: typeof amount.value === "string" ? amount.value : "0.00",
+    total,
+    dueAmount: dueAmountOf(raw, status, total),
     currency: typeof amount.currency_code === "string" ? amount.currency_code : "",
     dueDate: dueDateOf(detail),
     invoiceDate: typeof detail.invoice_date === "string" ? detail.invoice_date : null,
+    payUrl: payUrlOf(raw, detail),
   };
+}
+
+/** The balance outstanding after payments. PayPal returns it at the top level for partially paid invoices. */
+function dueAmountOf(raw: Record<string, unknown>, status: string, total: string): string | null {
+  const due = isObject(raw.due_amount) ? raw.due_amount : {};
+  if (typeof due.value === "string") return due.value;
+  return status === "PARTIALLY_PAID" ? null : total;
+}
+
+function payUrlOf(raw: Record<string, unknown>, detail: Record<string, unknown>): string | null {
+  const metadata = isObject(detail.metadata) ? detail.metadata : {};
+  for (const key of ["recipient_view_url", "payer_view_url"]) {
+    const value = metadata[key];
+    if (typeof value === "string" && value) return value;
+  }
+  const links = Array.isArray(raw.links) ? raw.links : [];
+  for (const rel of ["payer-view", "view"]) {
+    for (const link of links) {
+      if (isObject(link) && link.rel === rel && typeof link.href === "string" && link.href) return link.href;
+    }
+  }
+  for (const link of links) {
+    if (isObject(link) && typeof link.href === "string" && /\/invoicing\/invoices\//.test(link.href)) return link.href;
+  }
+  return null;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

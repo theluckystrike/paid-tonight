@@ -13,9 +13,11 @@ function invoice(overrides: Partial<UnpaidInvoice> = {}): UnpaidInvoice {
     customerName: "Anna Kowalski",
     customerEmail: "anna@example.com",
     total: "179.99",
+    dueAmount: "179.99",
     currency: "USD",
     dueDate: "2026-10-20",
     invoiceDate: "2026-10-10",
+    payUrl: null,
     ...overrides,
   };
 }

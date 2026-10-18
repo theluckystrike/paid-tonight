@@ -1,6 +1,6 @@
 import { extractDraft } from "./extract.js";
 import { takeAiCall, type Counter } from "./limit.js";
-import { totals } from "./money.js";
+import { discountWarning, totals } from "./money.js";
 import { PayPal } from "./paypal.js";
 import { draftReminder } from "./reminder.js";
 import { ExtractError, PayPalError, type AiRunner, type InvoiceDraft } from "./types.js";
@@ -142,6 +142,8 @@ const routes: Record<string, Handler> = {
     const { text } = await body<{ text?: string }>(req);
     if (typeof text !== "string" || text.trim().length < 10) throw new ExtractError("Describe the job in a sentence or two.");
     const draft = await extractDraft(text.slice(0, 2000), aiRunner(env), today());
+    const warning = discountWarning(draft);
+    if (warning && !draft.warnings.includes(warning)) draft.warnings.push(warning);
     return Response.json({ draft, totals: totals(draft) });
   },
   "POST /api/totals": async (req) => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { totals, toPayPalItems } from "../src/money";
+import { INVOICE_DISCOUNT_WARNING, discountWarning, invoiceDiscount, totals, toPayPalItems } from "../src/money";
 import type { InvoiceDraft } from "../src/types";
 
 function draft(overrides: Partial<InvoiceDraft> = {}): InvoiceDraft {
@@ -96,8 +96,81 @@ test("totals: an invoice discount with no tax", () => {
   assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "15.00", tax: "0.00", total: "115.00" });
 });
 
-test("totals: with tax, PayPal taxes the full lines and subtracts the invoice discount after tax (live sandbox case)", () => {
+test("totals: the discount is spread across the lines before tax (boiler reference case)", () => {
   const draft = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discount: "13.00",
     items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
-  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "29.90", total: "146.90" });
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "26.91", total: "143.91" });
+});
+
+test("totals: a 100 percent discount leaves no tax", () => {
+  const draft = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discount: "130.00",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "130.00", tax: "0.00", total: "0.00" });
+});
+
+test("totals: a discountPercent is computed from the subtotal and taxed after allocation", () => {
+  const draft = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discountPercent: "10",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "26.91", total: "143.91" });
+});
+
+test("totals: the discount remainder goes to the largest line", () => {
+  const draft = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "0.02",
+    items: [{ name: "Small", quantity: "1", unitAmount: "0.01" }, { name: "Big", quantity: "1", unitAmount: "0.02" }] };
+  assert.deepEqual(totals(draft), { subtotal: "0.03", discount: "0.02", tax: "0.00", total: "0.01" });
+});
+
+test("totals: tax rates with 3 decimals are exact", () => {
+  const draft = { customerName: "A", customerEmail: null, currency: "USD", taxPercent: "8.875", note: null, warnings: [],
+    items: [{ name: "Heater", quantity: "1", unitAmount: "1249.00" }, { name: "Labour", quantity: "3", unitAmount: "95.00", unit: "HOURS" as const }] };
+  assert.deepEqual(totals(draft), { subtotal: "1534.00", discount: "0.00", tax: "136.14", total: "1670.14" });
+});
+
+test("boiler: a 10 percent discount bakes into the unit prices, no item discount object", () => {
+  const d = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discountPercent: "10",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(d), { subtotal: "130.00", discount: "13.00", tax: "26.91", total: "143.91" });
+  const items = toPayPalItems(d);
+  assert.equal(items[0]?.unit_amount.value, "45.00");
+  assert.equal(items[1]?.unit_amount.value, "27.00");
+  assert.equal("discount" in items[0]!, false);
+  assert.equal("discount" in items[1]!, false);
+  assert.equal(items[0]?.description, "10% off included");
+  assert.equal(invoiceDiscount(d), null);
+  assert.equal(discountWarning(d), null);
+});
+
+test("boiler: a fixed 13.00 discount bakes in the same way and matches the percentage totals", () => {
+  const d = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discount: "13.00",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(d), { subtotal: "130.00", discount: "13.00", tax: "26.91", total: "143.91" });
+  const items = toPayPalItems(d);
+  assert.equal(items[0]?.unit_amount.value, "45.00");
+  assert.equal(items[1]?.unit_amount.value, "27.00");
+  assert.equal("discount" in items[0]!, false);
+  assert.equal(invoiceDiscount(d), null);
+  assert.equal(discountWarning(d), null);
+});
+
+test("a fixed 10.00 that cannot split exactly falls back to the invoice-level discount with a warning", () => {
+  const d = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discount: "10.00",
+    items: [{ name: "Hours", quantity: "3", unitAmount: "33.33" }] };
+  assert.deepEqual(totals(d), { subtotal: "99.99", discount: "10.00", tax: "23.00", total: "112.99" });
+  const items = toPayPalItems(d);
+  assert.equal(items[0]?.unit_amount.value, "33.33");
+  assert.equal("discount" in items[0]!, false);
+  assert.deepEqual(invoiceDiscount(d), { amount: { currency_code: "EUR", value: "10.00" } });
+  assert.equal(discountWarning(d), INVOICE_DISCOUNT_WARNING);
+});
+
+test("a 100 percent discount gives a 0.00 total", () => {
+  const d = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discountPercent: "100",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(d), { subtotal: "130.00", discount: "130.00", tax: "0.00", total: "0.00" });
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "0.00");
+});
+
+test("toPayPalItems: a 3 decimal tax percent is sent as given", () => {
+  const items = toPayPalItems(draft({ taxPercent: "8.875", items: [{ name: "Heater", quantity: "1", unitAmount: "1249.00" }] }));
+  assert.deepEqual(items[0]?.tax, { name: "Tax", percent: "8.875" });
 });

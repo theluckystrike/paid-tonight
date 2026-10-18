@@ -421,6 +421,15 @@ body {
   width: auto;
 }
 
+.actions--reminder {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.actions--reminder .btn {
+  width: 100%;
+}
+
 .qr {
   display: block;
   width: 220px;
@@ -492,6 +501,17 @@ body {
   color: var(--muted);
 }
 
+.unpaid-row__pay {
+  margin-left: auto;
+  font-size: 0.85rem;
+}
+
+.unpaid-row__due {
+  margin: 8px 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
 .app-footer {
   max-width: 640px;
   margin: 0 auto;
@@ -507,6 +527,12 @@ body {
 
 .app-footer a {
   color: var(--muted);
+}
+
+@media (max-width: 419px) {
+  .actions--reminder .btn--primary {
+    grid-column: 1 / -1;
+  }
 }
 
 @media (min-width: 768px) {
