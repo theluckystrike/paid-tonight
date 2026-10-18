@@ -42,8 +42,8 @@ function lineTotalCents(item) {
   return roundHalfUp(num, den);
 }
 
-// Same rule as the server (src/money.ts) and PayPal: tax per line, each rounded half-up; with an invoice discount,
-// tax on the discounted subtotal. The server re-checks PayPal's own total before anything is sent.
+// Same rule as the server (src/money.ts) and PayPal: tax per line on the full line amount, each rounded half-up,
+// and the invoice discount subtracted after tax. The server re-checks PayPal's own total before anything is sent.
 function percentBps(value) {
   const p = parseDecimal(value); // "23" -> 2300, "8.5" -> 850: percent in hundredths, rounded half-up like the server
   return roundHalfUp(p.coeff * 100n, 10n ** BigInt(p.scale));
@@ -56,8 +56,8 @@ function computeTotals(draft) {
   let discount = roundHalfUp(d.coeff * 100n, 10n ** BigInt(d.scale));
   if (discount > subtotal) discount = subtotal;
   const bps = draft.taxPercent == null ? 0n : percentBps(draft.taxPercent);
-  const tax = discount > 0n ? roundHalfUp((subtotal - discount) * bps, 10000n) : lines.reduce((a, c) => a + roundHalfUp(c * bps, 10000n), 0n);
-  return { subtotal: centsToStr(subtotal), discount: centsToStr(discount), tax: centsToStr(tax), total: centsToStr(subtotal - discount + tax) };
+  const tax = lines.reduce((a, c) => a + roundHalfUp(c * bps, 10000n), 0n); // PayPal: tax on full lines, discount after tax
+  return { subtotal: centsToStr(subtotal), discount: centsToStr(discount), tax: centsToStr(tax), total: centsToStr(subtotal + tax - discount) };
 }
 
 function newDraftId() {

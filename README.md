@@ -15,7 +15,7 @@ Finish the job, say what you did, and get paid before you leave. Paid Tonight tu
 
 <img src="docs/preview.png" alt="The invoice preview: customer, items, currency, discount, tax and totals" width="700">
 
-The preview above is the live demo with 23 percent VAT and the discount edited to 20: tax on the discounted subtotal, 135.30 EUR in total.
+The preview above is the live demo with 23 percent VAT and a discount; totals follow PayPal's rule of tax on the full lines and the discount after tax.
 
 ## Who it is for
 
@@ -25,7 +25,7 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 
 1. You type or speak the job. The browser's speech recognition fills the text box.
 2. The AI reads it and returns the customer, the email, each item with quantity and unit price, a discount, the tax rate and a short note. It never does the arithmetic. The job text is passed to the model as data inside tags, and the model is told to ignore instructions in it.
-3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does: tax per line, each rounded half up (with an invoice discount, tax on the discounted subtotal). A discount the model writes as an item is turned back into a discount, and "10 percent off" is computed from the subtotal. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged; links are removed from the note; amounts above 100,000 are refused. Warnings you should check also cover a zero price and a tax or discount that is mentioned but not applied.
+3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does, confirmed against the live sandbox: tax per line on the full line amount, each rounded half up, with an invoice discount subtracted after tax. A discount the model writes as an item is turned back into a discount, and "10 percent off" is computed from the subtotal. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged; links are removed from the note; amounts above 100,000 are refused. Warnings you should check also cover a zero price and a tax or discount that is mentioned but not applied.
 4. You correct anything in the preview (customer, items, currency, discount, tax) and tap "Send with PayPal". The server validates the edited draft again, creates the invoice with an invoice number tied to this draft and its content (a retry can never create or email a second invoice, and a corrected draft is never sent as the old one), reads back PayPal's own total and sends only if it equals the total you saw. You get the invoice number, the pay link and the PayPal QR code. Without an email, PayPal emails nobody and you share the QR code or link.
 5. In the Unpaid tab, the reminder agent reads your open invoices from PayPal and drafts a message: friendly when the invoice is due or slightly late, firm after 14 days. PayPal's reminder endpoint ignores custom text, so the app says so: "Send PayPal reminder" sends PayPal's standard reminder with the pay button, and "Email this message" opens your own email with the drafted text.
 

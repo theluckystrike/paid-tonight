@@ -90,8 +90,14 @@ test("totals: tax per line as PayPal computes it", () => {
   assert.deepEqual(totals(draft), { subtotal: "86.50", discount: "0.00", tax: "19.91", total: "106.41" });
 });
 
-test("totals: an invoice discount comes off before tax", () => {
+test("totals: an invoice discount with no tax", () => {
   const draft = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "15.00",
     items: [{ name: "Labour", quantity: "2", unitAmount: "50" }, { name: "Valve", quantity: "1", unitAmount: "30" }] };
   assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "15.00", tax: "0.00", total: "115.00" });
+});
+
+test("totals: with tax, PayPal taxes the full lines and subtracts the invoice discount after tax (live sandbox case)", () => {
+  const draft = { customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "23", note: null, warnings: [], discount: "13.00",
+    items: [{ name: "Boiler repair, labour", quantity: "2", unitAmount: "50.00" }, { name: "Valve", quantity: "1", unitAmount: "30.00" }] };
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "29.90", total: "146.90" });
 });

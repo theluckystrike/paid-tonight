@@ -44,9 +44,9 @@ function percentTax(cents: bigint, bps: bigint): bigint {
 }
 
 /**
- * Totals as PayPal computes them: tax per line, each line rounded half-up, then summed. With an invoice-level
- * discount, tax is taken on the discounted subtotal. /api/send re-reads PayPal's own total and refuses to send
- * when it differs, so a rounding difference can never reach a customer.
+ * Totals as PayPal computes them, confirmed against the live sandbox: tax per line on the full line amount, each
+ * rounded half-up, then the invoice-level discount is subtracted after tax. /api/send re-reads PayPal's own total and
+ * refuses to send when it differs, so a rounding difference can never reach a customer.
  */
 export function totals(draft: InvoiceDraft): Totals {
   const lines = draft.items.map(lineCents);
@@ -54,8 +54,8 @@ export function totals(draft: InvoiceDraft): Totals {
   const discount = draft.discount ? parseDecimal(draft.discount, 2) : 0n;
   if (discount > subtotal) throw new Error("discount is larger than the subtotal");
   const bps = draft.taxPercent == null ? 0n : parseDecimal(draft.taxPercent, 2);
-  const tax = discount > 0n ? percentTax(subtotal - discount, bps) : lines.reduce((a, c) => a + percentTax(c, bps), 0n);
-  const total = subtotal - discount + tax;
+  const tax = lines.reduce((a, c) => a + percentTax(c, bps), 0n);
+  const total = subtotal + tax - discount;
   return { subtotal: formatCents(subtotal), discount: formatCents(discount), tax: formatCents(tax), total: formatCents(total) };
 }
 

@@ -7,7 +7,7 @@ export interface InvoiceDraft {
   currency: string;
   items: LineItem[];
   taxPercent: string | null;
-  /** Invoice-level discount, a positive amount taken off before tax. */
+  /** Invoice-level discount, a positive amount subtracted after tax (PayPal's rule). */
   discount?: string | null;
   note: string | null;
   warnings: string[];
