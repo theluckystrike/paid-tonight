@@ -190,7 +190,7 @@ function extractQrBase64(body: string): string {
   return base64;
 }
 
-function mapInvoice(raw: unknown): UnpaidInvoice | null {
+export function mapInvoice(raw: unknown): UnpaidInvoice | null {
   if (!isObject(raw)) return null;
   const id = typeof raw.id === "string" ? raw.id : "";
   if (!id) return null;
@@ -203,7 +203,10 @@ function mapInvoice(raw: unknown): UnpaidInvoice | null {
   if (isObject(first)) {
     const billing = isObject(first.billing_info) ? first.billing_info : {};
     const name = isObject(billing.name) ? billing.name : {};
-    if (typeof name.full_name === "string") customerName = name.full_name;
+    // PayPal stores the full_name we send as given_name and surname, so read either form.
+    if (typeof name.full_name === "string" && name.full_name.trim()) customerName = name.full_name.trim();
+    else customerName = [name.given_name, name.surname].filter((v) => typeof v === "string" && v.trim()).join(" ");
+    if (!customerName && typeof billing.business_name === "string") customerName = billing.business_name;
     if (typeof billing.email_address === "string" && billing.email_address !== "") customerEmail = billing.email_address;
   }
   return {

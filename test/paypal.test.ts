@@ -329,3 +329,10 @@ test("L4: no tax given means no tax object on PayPal items", async () => {
   const items = toPayPalItems({ customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], items: [{ name: "x", quantity: "1", unitAmount: "5.00" }] });
   assert.equal("tax" in items[0]!, false);
 });
+
+test("unpaid list reads the customer name when PayPal splits it into given_name and surname", async () => {
+  const { mapInvoice } = await import("../src/paypal");
+  const row = mapInvoice({ id: "INV2-X", status: "SENT", detail: { invoice_number: "PT-1" }, amount: { value: "10.00", currency_code: "EUR" },
+    primary_recipients: [{ billing_info: { name: { given_name: "Ola", surname: "Nowak" }, email_address: "ola@example.com" } }] });
+  assert.equal(row?.customerName, "Ola Nowak");
+});

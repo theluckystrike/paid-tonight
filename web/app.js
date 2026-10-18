@@ -586,7 +586,7 @@ function showSuccess(ui, result) {
 function unpaidRow(ui, invoice) {
   const row = el("div", "unpaid-row");
   const top = el("div", "unpaid-row__top");
-  top.append(el("span", "unpaid-row__name", invoice.customerName || "Customer"));
+  top.append(el("span", "unpaid-row__name", invoice.customerName || invoice.customerEmail || "Customer"));
   top.append(el("span", "unpaid-row__amount", formatMoney(invoice.total, invoice.currency)));
   const bottom = el("div", "unpaid-row__bottom");
   const lbl = overdueLabel(invoice);
@@ -635,7 +635,7 @@ async function handleDraftReminder(ui, invoice, btn) {
 
 function buildReminderEditor(ui, invoice, reminder) {
   const card = el("div", "card");
-  card.append(el("h2", "card__title", `Reminder for ${invoice.customerName || "Customer"}`));
+  card.append(el("h2", "card__title", `Reminder for ${invoice.customerName || invoice.customerEmail || "Customer"}`));
 
   const subject = el("input", "input");
   subject.type = "text";
