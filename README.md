@@ -71,7 +71,7 @@ npx wrangler secret put PAYPAL_CLIENT_ID      # sandbox app from developer.paypa
 npx wrangler secret put PAYPAL_CLIENT_SECRET
 npx wrangler secret put DEMO_SEND_CODE        # optional: an access code for send, unpaid and reminders
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 79 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 80 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License
