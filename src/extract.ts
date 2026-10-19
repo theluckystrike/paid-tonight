@@ -1,5 +1,5 @@
 import { z, type ZodError } from "zod";
-import { INVOICE_DISCOUNT_WARNING, totals } from "./money.js";
+import { totals } from "./money.js";
 import { needsNameCheck, stripHonorific } from "./names.js";
 import { ExtractError } from "./types.js";
 import type { AiRunner, InvoiceDraft, LineItem } from "./types.js";
@@ -365,13 +365,6 @@ const PERCENT_OFF = new RegExp(
 const PERCENT_AFTER_NUMBER = new RegExp(`(${PCT_NUMBER})\\s*%\\s*(?:${DISCOUNT_WORDS})\\b`, "iu");
 const PERCENT_AFTER_WORD = new RegExp(`\\b(?:${DISCOUNT_WORDS})\\b\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(${PCT_NUMBER})\\s*%`, "iu");
 
-/** Find a percentage next to a discount word in any supported language, using a dot as the decimal mark. */
-function percentFromText(text: string): string | null {
-  const m = PERCENT_OFF.exec(text) ?? PERCENT_AFTER_NUMBER.exec(text) ?? PERCENT_AFTER_WORD.exec(text);
-  const value = m ? (m[1] ?? m[2] ?? "") : "";
-  return value ? value.replace(",", ".") : null;
-}
-
 // A currency amount written next to a discount word, so "10 percent off and 5 euro off" is seen as two discounts
 // even when the model repeats only the percent share in its amount field.
 const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
@@ -380,21 +373,45 @@ const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dolla
 // "5 szt", "4 Stunden" or "30 mins" is never read as a discount amount. Longer words come first so a prefix cannot win.
 // The single letters m, g and l are bare: the word boundary after the unit makes "50 m" a quantity while "50 mniej",
 // "50 less" or "50 lower" stays a discount amount, so no entry may swallow a word from DISCOUNT_AMOUNT_WORDS.
-const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|minutes?|minuten?|mins?|seconds?|secs?|tonnes?|box(?:es)?|bags?|litres?|liters?|grams?|metres?|meters?|kilometres?|kilometers?|visits?|rooms?|days?|kgs?|ml|cm|mm|km|kg|m|g|l)`;
+const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|taps?|radiators?|minutes?|minuten?|mins?|seconds?|secs?|tonnes?|box(?:es)?|bags?|litres?|liters?|grams?|metres?|meters?|kilometres?|kilometers?|visits?|rooms?|days?|kgs?|ml|cm|mm|km|kg|m|g|l|h)`;
 // A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
 // The number is anchored on both sides, so backtracking cannot read the "1" of "rabat 15%" as an amount.
 const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))(?!\s*(?:${ITEM_WORD})\b)`;
 const AMOUNT_WITH_DISCOUNT = new RegExp(
   `${MONEY_AMOUNT}\\s*(?:${MONEY_CURRENCY})?\\s*(?:${DISCOUNT_AMOUNT_WORDS})\\b` +
-  `|\\b(?:${DISCOUNT_AMOUNT_WORDS})\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(?:${MONEY_CURRENCY}\\s*)?${MONEY_AMOUNT}`,
+  `|\\b(?:${DISCOUNT_AMOUNT_WORDS})\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(?:${MONEY_CURRENCY}\\s*)?${MONEY_AMOUNT}` +
+  // "10% off 3 taps" names a quantity: a plain word after the number that follows a discount word is not money.
+  `(?!\\s*(?!(?:${MONEY_CURRENCY}|${DISCOUNT_AMOUNT_WORDS})\\b)\\p{L})`,
   "iu",
 );
 
-/** The currency amount named next to a discount word, as a plain decimal, or null. */
-function amountFromText(text: string): string | null {
+interface TextMatch {
+  value: string;
+  start: number;
+  end: number;
+}
+
+function percentInText(text: string): TextMatch | null {
+  const m = PERCENT_OFF.exec(text) ?? PERCENT_AFTER_NUMBER.exec(text) ?? PERCENT_AFTER_WORD.exec(text);
+  const value = m ? (m[1] ?? m[2] ?? "") : "";
+  return value ? { value: value.replace(",", "."), start: m!.index, end: m!.index + m![0].length } : null;
+}
+
+function amountInText(text: string): TextMatch | null {
   const m = AMOUNT_WITH_DISCOUNT.exec(text);
   const value = m ? (m[1] ?? m[2] ?? "") : "";
-  return value ? value.replace(",", ".") : null;
+  return value ? { value: value.replace(",", "."), start: m!.index, end: m!.index + m![0].length } : null;
+}
+
+// A joining word between the percent and the amount means the seller named two discounts. A restating word such as
+// "so", "czyli" or "that is" means the amount only says what the percent comes to.
+const JOINING_WORD = /\b(?:and|plus|another|also|i|oraz|und|y|et|en)\b/iu;
+
+function hasJoiningWord(text: string, percent: TextMatch, amount: TextMatch): boolean {
+  const percentFirst = percent.start < amount.start;
+  const start = percentFirst ? percent.end : amount.end;
+  const end = percentFirst ? amount.start : percent.start;
+  return end > start && JOINING_WORD.test(text.slice(start, end));
 }
 
 function normalize(raw: RawDraft, text: string): InvoiceDraft {
@@ -419,9 +436,9 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
   const subtotal = cents(items);
   if (subtotal >= TOTAL_BLOCK_CENTS) throw new ExtractError("The total is above 100,000. Check the amounts and try again.");
   // A percentage discount is a share of the work, not that number in money: compute it from the subtotal in code.
-  const textPercent = percentFromText(text);
-  const textAmount = amountFromText(text);
-  const percentValue = raw.discountPercent == null ? textPercent : formatPercent(raw.discountPercent);
+  const textPercent = percentInText(text);
+  const textAmount = amountInText(text);
+  const percentValue = raw.discountPercent == null ? textPercent?.value ?? null : formatPercent(raw.discountPercent);
   const rawName = (raw.customerName ?? "").trim();
   const customerName = stripHonorific(rawName) || "Customer";
   if (!rawName) warnings.push("No customer name");
@@ -434,17 +451,21 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
 
   let appliedPercent: string | null = null;
   let extraFixed = 0n;
-  // A second fixed amount is billed whenever the description itself writes that amount next to a discount word and the
-  // model returns the same figure, even when it lands on the percent share or the discount the percent bakes in. The
-  // echo test is left for a description that names no amount: a model often repeats the percent number, the percent
-  // share or the baked discount in its amount field, and none of those is a second discount.
-  const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
+  // A named amount that lands on the percent number, the percent share or the baked discount is usually the seller
+  // saying what the percent comes to. Bill it as a second discount only when a joining word sits between the percent
+  // and the amount. A model echo of the same values in a description that names no amount is never a second discount.
+  const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount.value, 2) ?? 0n);
   if (percentValue != null) {
     const hundredths = scaleRound(percentValue, 2);
     if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
       appliedPercent = percentValue;
       draft.discountPercent = appliedPercent;
-      if (namedAmount > 0n && fixedDiscount === namedAmount) extraFixed = fixedDiscount;
+      const share = (subtotal * hundredths + 5000n) / 10000n;
+      const bakedFixed = scaleRound(totals(draft).discount, 2) ?? 0n;
+      const off = (target: bigint) => (fixedDiscount > target ? fixedDiscount - target : target - fixedDiscount);
+      const restates = off(hundredths) <= 100n || off(share) <= 100n || off(bakedFixed) <= 100n;
+      const joined = textPercent != null && textAmount != null && hasJoiningWord(text, textPercent, textAmount);
+      if (namedAmount > 0n && fixedDiscount === namedAmount && (!restates || joined)) extraFixed = fixedDiscount;
     }
   }
   if (appliedPercent != null) {
@@ -456,7 +477,7 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
       let plan: ReturnType<typeof totals>;
       try { plan = totals(draft); } catch { throw new ExtractError("The discounts are larger than the work billed."); }
       warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(extraFixed)} amount, so ${plan.discount} comes off in total`);
-      warnings.push(INVOICE_DISCOUNT_WARNING);
+      warnings.push(`The ${formatPercent(appliedPercent)}% comes off before tax and the ${formatMoney(extraFixed)} after tax`);
     } else {
       const baked = totals(draft).discount;
       if (namedAmount > 0n) {
@@ -466,9 +487,9 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
       } else {
         warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
         if (textPercent != null) {
-          const textPercentValue = formatPercent(textPercent);
+          const textPercentValue = formatPercent(textPercent.value);
           if (formatPercent(appliedPercent) !== textPercentValue) {
-            const textShare = (subtotal * (scaleRound(textPercent, 2) ?? 0n) + 5000n) / 10000n;
+            const textShare = (subtotal * (scaleRound(textPercent.value, 2) ?? 0n) + 5000n) / 10000n;
             warnings.push(`Discount is ${baked}, not ${textPercentValue}% of the subtotal (${formatMoney(textShare)}); check it`);
           }
         }

@@ -414,8 +414,8 @@ test("R14: a percent and a separate fixed amount in the text are both billed, 18
   assert.equal(draft.discount, "5.00");
   assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "18.00", tax: "26.91", total: "138.91" });
   assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("5.00") && w.includes("18.00")), draft.warnings.join(" | "));
-  // The fixed part is taken by PayPal after tax, so the draft carries the after tax warning.
-  assert.ok(draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+  // The fixed part is taken by PayPal after tax, so the draft says which part comes off on each side of tax.
+  assert.ok(draft.warnings.some((w) => w.includes("The 10% comes off before tax and the 5.00 after tax")), draft.warnings.join(" | "));
 });
 
 test("R14: a named amount the model leaves out is not billed and the seller is told to check", async () => {
@@ -450,7 +450,7 @@ test("R14: a percent and a separate fixed amount in the text are both billed, Ge
   assert.equal(draft.discount, "5.00");
   // The percent bakes, tax is charged on 180.00 and the 5.00 is taken at invoice level: 180.00 + 34.20 - 5.00.
   assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "25.00", tax: "34.20", total: "209.20" });
-  assert.ok(draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+  assert.ok(draft.warnings.some((w) => w.includes("The 10% comes off before tax and the 5.00 after tax")), draft.warnings.join(" | "));
 });
 
 test("R14: discounts that together exceed the work billed are refused", async () => {
@@ -512,6 +512,38 @@ test("R15: the review case, a named amount that lands on the percent share is st
   assert.equal(draft.discount, "50.00");
   assert.deepEqual(totals(draft), { subtotal: "500.00", discount: "100.00", tax: "0.00", total: "400.00" });
   assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("50.00") && w.includes("100.00")), draft.warnings.join(" | "));
+});
+
+test("R16: an amount that restates the percent is not billed twice, 143.91 and the check it warning", async () => {
+  // "so" restates the percent: the 13 euro is what the 10% comes to, not a second discount.
+  const text = "130 euro for Ola, 10% off, so 13 euro off";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "13", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "130", unit: "HOURS" }], taxPercent: "23" })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, undefined);
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "26.91", total: "143.91" });
+  assert.ok(draft.warnings.some((w) => w.includes("13.00") && w.includes("check it")), draft.warnings.join(" | "));
+});
+
+test("R16: czyli restates the percent, 235.24 and the check it warning", async () => {
+  const text = "Naprawa u Oli, 225 z\u0142, rabat 15%, czyli 33,75 z\u0142 mniej";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "PLN", discount: "33.75", discountPercent: "15",
+    items: [{ name: "Robota", quantity: "1", unitAmount: "225" }], taxPercent: "23" })), TODAY);
+  assert.equal(draft.discountPercent, "15");
+  assert.equal(draft.discount, undefined);
+  assert.deepEqual(totals(draft), { subtotal: "225.00", discount: "33.75", tax: "43.99", total: "235.24" });
+  assert.ok(draft.warnings.some((w) => w.includes("33.75") && w.includes("check it")), draft.warnings.join(" | "));
+});
+
+test("R16: a plain noun after a number that follows off is a quantity, never a discount", async () => {
+  for (const text of ["Fixed, 10% off 3 taps, work 130", "Fixed, 10% off 3 radiators, work 130", "Fixed, 10% off 3 h labour, work 130"]) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: null, discountPercent: "10",
+      items: [{ name: "Work", quantity: "1", unitAmount: "130" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discount, undefined, text);
+    assert.equal(draft.discountPercent, "10", text);
+    assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "13.00", tax: "0.00", total: "117.00" }, text);
+    assert.ok(!draft.warnings.some((w) => w.includes("amount")), text + " | " + draft.warnings.join(" | "));
+  }
 });
 
 test("R14: the same rule sees a word such as mniej or minus next to a separate amount", async () => {
