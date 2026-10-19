@@ -380,6 +380,19 @@ test("R12: the German fractional hour percent warning shows the baked total, 147
   assert.ok(!draft.warnings.some((w) => w.includes("147.83")), draft.warnings.join(" | "));
 });
 
+test("R12: a model that repeats the baked discount amount is not a second discount", async () => {
+  const text = "Arbeit bei Herrn Weber, 3,5 Std. à 65,50 €, Heizung 1249,00 €, 19 % MwSt., 10 % Rabatt";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: "147.82", discountPercent: "10",
+    items: [{ name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" }, { name: "Heizung", quantity: "1", unitAmount: "1249.00" }] })), TODAY);
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(totals(draft).discount, "147.82");
+  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
+  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
+  assert.ok(aboutDiscount[0]!.includes("Discount of 10% applied for 147.82"), aboutDiscount.join(" | "));
+  assert.ok(!aboutDiscount[0]!.includes("check it"), aboutDiscount.join(" | "));
+});
+
 test("R12: a text that names both a percent and a fixed amount gives one clear warning", async () => {
   const text = "2 hours at 50 for Ola, 10 percent off and another 5 euro off";
   const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "5", discountPercent: "10",

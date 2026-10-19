@@ -168,12 +168,14 @@ test("H5: with DEMO_SEND_CODE set, PayPal routes need the code; drafting does no
   assert.equal(totalsRes.status, 200);
 });
 
-test("R12: maskEmail keeps the first letter and the domain", () => {
+test("R12: maskEmail keeps the first letter and the domain, and refuses anything that is not an address", () => {
   assert.equal(maskEmail("anna@example.com"), "a***@example.com");
   assert.equal(maskEmail("ola.nowak@firma.pl"), "o***@firma.pl");
   assert.equal(maskEmail(""), null);
   assert.equal(maskEmail(null), null);
-  assert.equal(maskEmail("not an email"), "not an email");
+  assert.equal(maskEmail("not an email"), null);
+  assert.equal(maskEmail("anna@"), null);
+  assert.equal(maskEmail("@x.com"), null);
 });
 
 test("R12: PayPal write routes are rate limited per address with a plain 429", async () => {

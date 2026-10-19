@@ -357,4 +357,6 @@ test("a masked customer email opens the reminder draft without a recipient", () 
   const url = reminderMailto({ customerEmail: "e***@example.com", payUrl: null }, "Invoice", "Hello");
   assert.ok(url.startsWith("mailto:?subject="), url);
   assert.ok(reminderMailto({ customerEmail: "ewa@example.com", payUrl: null }, "Invoice", "Hello").startsWith("mailto:ewa%40example.com?"));
+  const starred = reminderMailto({ customerEmail: "we*ird@example.com", payUrl: null }, "Invoice", "Hello");
+  assert.ok(starred.startsWith("mailto:we*ird%40example.com?"), starred);
 });

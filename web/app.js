@@ -355,7 +355,7 @@ function reminderMailto(invoice, subject, note) {
   const payUrl = safeHref(invoice.payUrl);
   const body = [String(note || "").trim(), payUrl ? `Pay online at ${payUrl}` : ""].filter(Boolean).join("\n\n");
   // A masked address cannot receive mail, so the draft opens without a recipient for the seller to fill in.
-  const to = String(invoice.customerEmail).includes("*") ? "" : encodeURIComponent(invoice.customerEmail);
+  const to = /^\S\*\*\*@\S+$/.test(String(invoice.customerEmail)) ? "" : encodeURIComponent(invoice.customerEmail);
   return "mailto:" + to + "?subject=" + encodeURIComponent(String(subject || "").trim()) + "&body=" + encodeURIComponent(body);
 }
 

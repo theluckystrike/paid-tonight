@@ -432,15 +432,16 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
     const hundredths = scaleRound(percentValue, 2);
     if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
       appliedPercent = percentValue;
+      // A percent wins: the draft carries the percent alone, so no stale amount can block a later total. The amount box
+      // in the preview shows the discount the server computes, read-only.
+      draft.discountPercent = appliedPercent;
       const share = (subtotal * hundredths + 5000n) / 10000n;
-      // A model may repeat the percent number or the computed share in the fixed discount field; that is not a second discount.
-      if (fixedDiscount > 0n && fixedDiscount !== hundredths && fixedDiscount !== share) extraFixed = fixedDiscount;
+      const bakedFixed = scaleRound(totals(draft).discount, 2) ?? 0n;
+      // A model may repeat the percent number, the computed share or the baked discount in the fixed field; none is a second discount.
+      if (fixedDiscount > 0n && fixedDiscount !== hundredths && fixedDiscount !== share && fixedDiscount !== bakedFixed) extraFixed = fixedDiscount;
     }
   }
   if (appliedPercent != null) {
-    // A percent wins: the draft carries the percent alone, so no stale amount can block a later total. The amount box
-    // in the preview shows the discount the server computes, read-only.
-    draft.discountPercent = appliedPercent;
     const baked = totals(draft).discount;
     // The text itself may name a currency amount next to a discount word, even when the model's amount is the percent share.
     const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);

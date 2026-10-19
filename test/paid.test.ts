@@ -29,10 +29,12 @@ interface Req {
   headers: Record<string, string>;
 }
 
-function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: boolean; paymentTimesOut?: boolean; paymentTimesOutPaid?: boolean } = {}) {
+function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: boolean; paymentTimesOut?: boolean; paymentTimesOutPaid?: boolean; cancelDelay?: number } = {}) {
   const calls: Req[] = [];
   const invoices = new Map<string, InvoiceRow>();
   let verification = opts.verify ?? "SUCCESS";
+  let cancelInFlight = 0;
+  let maxCancelInFlight = 0;
   const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
     const u = new URL(input instanceof Request ? input.url : String(input));
     const method = init?.method ?? "GET";
@@ -50,7 +52,13 @@ function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: 
     if (u.pathname === "/v1/notifications/webhooks" && method === "POST") return Response.json({ id: "WH-NEW" }, { status: 201 });
     if (u.pathname === "/v2/invoicing/invoices" && method === "GET") return Response.json({ items: [...invoices.values()] });
     const m = /^\/v2\/invoicing\/invoices\/([^/]+)(?:\/(payments|send|generate-qr-code|remind|cancel))?$/.exec(u.pathname);
-    if (m && m[2] === "cancel") return new Response(null, { status: 204 });
+    if (m && m[2] === "cancel") {
+      cancelInFlight += 1;
+      maxCancelInFlight = Math.max(maxCancelInFlight, cancelInFlight);
+      if (opts.cancelDelay) await new Promise((resolve) => setTimeout(resolve, opts.cancelDelay));
+      cancelInFlight -= 1;
+      return new Response(null, { status: 204 });
+    }
     const inv = m ? invoices.get(decodeURIComponent(m[1]!)) : undefined;
     if (!m || !inv) return Response.json({ name: "RESOURCE_NOT_FOUND" }, { status: 404 });
     if (m[2] === "payments") {
@@ -70,7 +78,7 @@ function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: 
     if (m[2] === "generate-qr-code") return new Response("iVBORw0KGgo=");
     return Response.json(inv);
   }) as typeof fetch;
-  return { calls, invoices, fetchFn, setVerify: (v: string) => { verification = v; } };
+  return { calls, invoices, fetchFn, setVerify: (v: string) => { verification = v; }, maxCancelInFlight: () => maxCancelInFlight };
 }
 
 function kv() {
@@ -326,6 +334,20 @@ test("R10: admin cancel-invoice cancels each id with a note and no recipient sen
   assert.ok((body.note ?? "").length > 0);
   assert.equal(body.send_to_invoicer, false);
   assert.equal(body.send_to_recipient, false);
+});
+
+test("R10: admin cancel-invoice runs bounded batches of 5 and keeps every per id result", async () => {
+  const pp = fakePayPal({ cancelDelay: 5 });
+  const ids = Array.from({ length: 12 }, (_, i) => `INV2-${i}`);
+  const r = await call(envWith(pp, kv(), { ADMIN_CODE: "admin-secret" }), "/api/admin/cancel-invoice",
+    { invoiceIds: ids }, { "x-admin-code": "admin-secret" });
+  assert.equal(r.status, 200);
+  const results = r.body.results as Array<{ id: string; ok: boolean; status?: string }>;
+  assert.deepEqual(results.map((x) => x.id), ids);
+  assert.ok(results.every((x) => x.ok && x.status === "CANCELLED"));
+  assert.equal(pp.calls.filter((c) => c.path.endsWith("/cancel")).length, ids.length);
+  assert.ok(pp.maxCancelInFlight() <= 5, `max in flight ${pp.maxCancelInFlight()}`);
+  assert.ok(pp.maxCancelInFlight() > 1, `max in flight ${pp.maxCancelInFlight()}`);
 });
 
 test("R10: admin cancel-invoice refuses more than 50 ids and an id that is not a PayPal invoice id", async () => {

@@ -31,13 +31,20 @@ const NOT_OPEN = new Set([...PAID_STATUSES, "CANCELLED", "REFUNDED"]);
 /** Show a customer email as its first letter, three stars and the domain, so the demo never shows a full address. */
 export function maskEmail(email: string | null | undefined): string | null {
   const text = (email ?? "").trim();
-  const at = text.lastIndexOf("@");
-  if (at <= 0 || at === text.length - 1) return text || null;
+  const at = text.indexOf("@");
+  if (at <= 0 || at !== text.lastIndexOf("@") || at === text.length - 1) return null;
   return `${text[0]}***@${text.slice(at + 1)}`;
 }
 
 /** Write routes that talk to PayPal, one shared bucket per address. The webhook is never limited. */
-const RATE_LIMITED = new Set(["POST /api/send", "POST /api/reminder", "POST /api/remind", "POST /api/invoice/{id}/record-payment"]);
+const RATE_LIMITED = new Set([
+  "POST /api/send",
+  "POST /api/reminder",
+  "POST /api/remind",
+  "POST /api/invoice/{id}/record-payment",
+  "POST /api/admin/cancel-invoice",
+  "POST /api/admin/register-webhook",
+]);
 export const WRITE_RATE_LIMIT_PER_HOUR = 20;
 
 /** A plain per-address brake on the PayPal write routes, using the same KV store as the webhook hints. */
@@ -149,6 +156,8 @@ const DRAFT_ID = /^[A-Za-z0-9]{8,16}$/;
 const PAYPAL_INVOICE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{3,63}$/;
 /** The admin cancel route accepts at most this many ids in one request. */
 export const CANCEL_MAX_IDS = 50;
+/** Cancel calls run in bounded batches, so one slow PayPal call cannot hold up the whole request. */
+const CANCEL_BATCH_SIZE = 5;
 
 /** Owner-only cancel for a batch of PayPal invoices, guarded exactly like the webhook setup route. */
 async function cancelInvoices(req: Request, env: Env): Promise<Response> {
@@ -163,13 +172,18 @@ async function cancelInvoices(req: Request, env: Env): Promise<Response> {
   if (!ids.every((id) => typeof id === "string" && PAYPAL_INVOICE_ID.test(id))) throw new ExtractError("Every invoice id must look like a PayPal invoice id.");
   const pp = paypal(env);
   const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
-  for (const id of ids as string[]) {
-    try {
+  const all = ids as string[];
+  for (let start = 0; start < all.length; start += CANCEL_BATCH_SIZE) {
+    const batch = all.slice(start, start + CANCEL_BATCH_SIZE);
+    const settled = await Promise.allSettled(batch.map(async (id) => {
       await pp.cancel(id);
-      results.push({ id, ok: true, status: "CANCELLED" });
-    } catch (err) {
-      results.push({ id, ok: false, error: err instanceof PayPalError ? err.message : "The invoice could not be cancelled." });
-    }
+      return { id, ok: true, status: "CANCELLED" };
+    }));
+    settled.forEach((outcome, index) => {
+      const id = batch[index]!;
+      if (outcome.status === "fulfilled") results.push(outcome.value);
+      else results.push({ id, ok: false, error: outcome.reason instanceof PayPalError ? outcome.reason.message : "The invoice could not be cancelled." });
+    });
   }
   return Response.json({ results });
 }
