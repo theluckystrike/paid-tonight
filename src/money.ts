@@ -118,9 +118,6 @@ function allocateBakeable(lines: bigint[], qScaled: bigint[], unitCents: bigint[
 /** The warning shown when PayPal can only take the discount at invoice level, after tax. */
 export const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
 
-/** The warning shown when the draft carries both a fixed discount and a percentage discount that disagree. */
-export const BOTH_DISCOUNTS_WARNING = "Give either a discount amount or a discount percent, not both";
-
 
 interface DiscountPlan {
   lines: bigint[];
@@ -131,6 +128,8 @@ interface DiscountPlan {
   baked: boolean;
   /** The percentage as given, for the item description, or null for a fixed discount. */
   percent: string | null;
+  /** The part PayPal must take at invoice level, after tax. Zero when everything is baked into the unit prices. */
+  invoiceDiscount: bigint;
   warning: string | null;
 }
 
@@ -186,12 +185,12 @@ function percentPlan(lines: bigint[], unitCents: bigint[], qScaled: bigint[], pc
       adjustedUnits[single] = unitCents[single]! - share;
       const adjustedTotal = adjusted.reduce((a, b) => a + b, 0n);
       if (!offByMoreThanHalfPoint(adjustedTotal, subtotal, pct)) {
-        return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, warning: null };
+        return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, invoiceDiscount: 0n, warning: null };
       }
     }
-    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, warning: INVOICE_DISCOUNT_WARNING };
+    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, invoiceDiscount: target, warning: INVOICE_DISCOUNT_WARNING };
   }
-  return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, warning: null };
+  return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, invoiceDiscount: 0n, warning: null };
 }
 
 /**
@@ -199,7 +198,9 @@ function percentPlan(lines: bigint[], unitCents: bigint[], qScaled: bigint[], pc
  * item.discount cannot give VAT after the discount. A discount is baked into the unit prices instead, which PayPal
  * taxes correctly. A percentage bakes by reducing each unit price and taking the difference from the original line,
  * the way PayPal rounds a line. A fixed amount bakes when its shares divide exactly by each quantity (the leftover
- * cents go on a quantity 1 line); otherwise PayPal takes it at invoice level, after tax, and the draft warns.
+ * cents go on a quantity 1 line); otherwise PayPal takes it at invoice level, after tax, and the draft warns. When a
+ * draft carries both a percentage and a separate fixed amount, the percentage bakes and the fixed amount is added at
+ * invoice level, after tax, so both come off.
  */
 function discountPlan(draft: InvoiceDraft): DiscountPlan {
   const qScaled = draft.items.map((item) => parseDecimal(item.quantity, 3));
@@ -213,12 +214,17 @@ function discountPlan(draft: InvoiceDraft): DiscountPlan {
     const pct = parseDecimal(percent, 2);
     const plan = percentPlan(lines, unitCents, qScaled, pct, percent);
     if (fixed != null) {
-      const share = (subtotal * pct + 5000n) / 10_000n;
-      // The amount is not a second discount when it is the percent's unbaked share or the discount the percent bakes
-      // after per-line rounding, so the preview's read-only amount box and the server agree.
-      if (parseDecimal(fixed, 2) !== share && parseDecimal(fixed, 2) !== plan.totalDiscount) {
-        return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
-      }
+      // A draft carries a separate amount only when the description named both a percent and an amount (the extractor
+      // drops a model echo of the percent's own share), so both come off: the percent bakes and the amount is taken
+      // at invoice level. Taking off more than the subtotal is refused.
+      const fixedCents = parseDecimal(fixed, 2);
+      if (plan.totalDiscount + fixedCents > subtotal) throw new Error("discount is larger than the subtotal");
+      return {
+        lines, unitCents: plan.unitCents, lineDiscount: plan.lineDiscount,
+        totalDiscount: plan.totalDiscount + fixedCents, baked: plan.baked, percent: plan.percent,
+        invoiceDiscount: plan.baked ? fixedCents : plan.totalDiscount + fixedCents,
+        warning: plan.baked ? null : INVOICE_DISCOUNT_WARNING,
+      };
     }
     return plan;
   }
@@ -228,17 +234,19 @@ function discountPlan(draft: InvoiceDraft): DiscountPlan {
     const allocated = allocateBakeable(lines, qScaled, unitCents, discount);
     if (allocated) {
       const reduced = allocated.map((cents, i) => unitCents[i]! - (qScaled[i]! > 0n ? (cents * 1000n) / qScaled[i]! : 0n));
-      return { lines, unitCents: reduced, lineDiscount: allocated, totalDiscount: discount, baked: true, percent: null, warning: null };
+      return { lines, unitCents: reduced, lineDiscount: allocated, totalDiscount: discount, baked: true, percent: null, invoiceDiscount: 0n, warning: null };
     }
-    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: discount, baked: false, percent: null, warning: INVOICE_DISCOUNT_WARNING };
+    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: discount, baked: false, percent: null, invoiceDiscount: discount, warning: INVOICE_DISCOUNT_WARNING };
   }
-  return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: null };
+  return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, invoiceDiscount: 0n, warning: null };
 }
 
 /**
  * Totals for a draft. A percentage discount is baked into the unit prices and tax is charged per line on the
  * discounted amount. A fixed discount that divides exactly by each quantity bakes the same way; one that cannot is
  * taken by PayPal at invoice level, so tax is charged on the full lines and the discount is subtracted after tax.
+ * When a draft carries both a percentage and a separate fixed amount, the percentage bakes, tax is charged on the
+ * discounted lines, and the fixed amount is subtracted at invoice level, after tax.
  * Every tax amount is rounded half-up per line. /api/send re-reads PayPal's own total and refuses to send when it
  * differs, so a rounding difference can never reach a customer.
  */
@@ -261,13 +269,14 @@ export function discountWarning(draft: InvoiceDraft): string | null {
 }
 
 /**
- * The invoice-level discount for PayPal, or null when there is none to send. It is only present for a fixed discount
- * whose share per line does not divide exactly by the quantity; every other discount is baked into the unit prices.
+ * The invoice-level discount for PayPal, or null when there is none to send. It carries the part PayPal must take
+ * after tax: a fixed discount whose share per line does not divide exactly by the quantity, a percentage that cannot
+ * bake, or the fixed amount of a draft that also carries a percentage.
  */
 export function invoiceDiscount(draft: InvoiceDraft): { amount: { currency_code: string; value: string } } | null {
   const plan = discountPlan(draft);
-  if (plan.baked || plan.totalDiscount <= 0n) return null;
-  return { amount: { currency_code: draft.currency, value: formatCents(plan.totalDiscount) } };
+  if (plan.invoiceDiscount <= 0n) return null;
+  return { amount: { currency_code: draft.currency, value: formatCents(plan.invoiceDiscount) } };
 }
 
 export function toPayPalItems(draft: InvoiceDraft): PayPalItem[] {

@@ -68,8 +68,9 @@ function lineTotalCents(item) {
 
 // Same rule as the server (src/money.ts) and PayPal: a percentage discount (and a fixed one that divides exactly by
 // each quantity) is baked into the unit prices, so tax is charged per line on the discounted amount, rounded half-up.
-// A fixed discount that cannot be baked is taken by PayPal at invoice level, after tax, with a warning. The server
-// re-checks PayPal's own total.
+// A fixed discount that cannot be baked is taken by PayPal at invoice level, after tax, with a warning. A percentage
+// and a separate fixed amount are both billed: the percentage bakes and the amount is taken at invoice level. The
+// server re-checks PayPal's own total.
 function scaledDecimal(raw, scale) {
   const p = parseDecimal(raw);
   return roundHalfUp(p.coeff * (10n ** BigInt(scale)), 10n ** BigInt(p.scale));
@@ -84,7 +85,6 @@ function lineCentsFor(qScaled, unitCents) {
 }
 
 const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
-const BOTH_DISCOUNTS_WARNING = "Give either a discount amount or a discount percent, not both";
 
 function gcd(a, b) {
   while (b > 0n) {
@@ -213,10 +213,17 @@ function discountPlan(draft) {
     const pct = clampPercent(scaledDecimal(percent, 2));
     const plan = percentPlan(lines, unitCents, qScaled, pct, percent);
     if (fixed != null) {
-      const share = (subtotal * pct + 5000n) / 10000n;
-      if (scaledDecimal(fixed, 2) !== share && scaledDecimal(fixed, 2) !== plan.totalDiscount) {
-        return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
-      }
+      // A percent and a separate amount are both billed: the percent bakes into the unit prices and the amount goes
+      // to PayPal at invoice level, after tax. The preview caps the amount at what is left, so its total can never
+      // go negative; the server refuses a draft where the two together take off more than the subtotal.
+      const fixedCents = scaledDecimal(fixed, 2);
+      const remaining = subtotal > plan.totalDiscount ? subtotal - plan.totalDiscount : 0n;
+      const fixedPart = fixedCents > remaining ? remaining : fixedCents;
+      return {
+        lines: plan.lines, unitCents: plan.unitCents, lineDiscount: plan.lineDiscount,
+        totalDiscount: plan.totalDiscount + fixedPart, baked: plan.baked, percent: plan.percent,
+        warning: plan.baked ? null : INVOICE_DISCOUNT_WARNING,
+      };
     }
     return plan;
   }
@@ -245,12 +252,15 @@ function computeTotals(draft) {
   return { subtotal: centsToStr(subtotal), discount: centsToStr(plan.totalDiscount), tax: centsToStr(tax), total: centsToStr(subtotal - plan.totalDiscount + tax) };
 }
 
-// The preview keeps one source of truth for the discount. A percent wins: any fixed amount is dropped, so the server
-// never sees two discounts, and the amount box shows exactly the discount discountPlan computes. Typing an amount
-// clears the percent. The server runs the same discountPlan, so the browser total and the server total stay equal.
+// The preview keeps one source of truth for the discount. A lone percent shows its computed discount in the amount
+// box, read only. When the description named both a percent and a separate amount, both are billed: the percent bakes
+// and the amount goes at invoice level, and the amount box stays editable so the seller can change or clear it.
+// Typing an amount with no percent clears the percent. The server runs the same discountPlan, so the totals stay equal.
 function discountChoice(draft) {
   const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "";
   if (!percent) return { draft: { ...draft, discountPercent: null }, amount: draft.discount || "", locked: false };
+  const fixed = draft.discount != null && String(draft.discount).trim() !== "";
+  if (fixed) return { draft, amount: draft.discount, locked: false };
   const clean = { ...draft, discount: null };
   const cents = discountPlan(clean).totalDiscount;
   return { draft: clean, amount: cents > 0n ? centsToStr(cents) : "", locked: true };

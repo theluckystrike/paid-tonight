@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { INVOICE_DISCOUNT_WARNING, BOTH_DISCOUNTS_WARNING, discountWarning, invoiceDiscount, totals, toPayPalItems } from "../src/money";
+import { INVOICE_DISCOUNT_WARNING, discountWarning, invoiceDiscount, totals, toPayPalItems } from "../src/money";
 import type { InvoiceDraft } from "../src/types";
 
 function draft(overrides: Partial<InvoiceDraft> = {}): InvoiceDraft {
@@ -200,21 +200,28 @@ test("percent: on a line that cannot divide, per-unit rounding falls back to the
   assert.equal(discountWarning(d), INVOICE_DISCOUNT_WARNING);
 });
 
-test("both discounts: a fixed amount equal to the percent share is the same percent, no warning", () => {
+test("both discounts: a separate amount equal to the percent share is still a second discount", () => {
   const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "20.00", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }] };
-  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" });
+  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "40.00", tax: "0.00", total: "160.00" });
   assert.equal(discountWarning(d), null);
-  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "180.00");
+  assert.deepEqual(invoiceDiscount(d), { amount: { currency_code: "EUR", value: "20.00" } });
 });
 
-test("both discounts: a fixed amount that disagrees with the percent is refused with a warning, neither is dropped", () => {
+test("both discounts: a separate fixed amount is added at invoice level on top of the baked percent", () => {
   const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "10.00", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }] };
-  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "0.00", tax: "0.00", total: "200.00" });
-  assert.equal(discountWarning(d), BOTH_DISCOUNTS_WARNING);
-  assert.equal(invoiceDiscount(d), null);
-  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "200.00");
+  assert.deepEqual(totals(d), { subtotal: "200.00", discount: "30.00", tax: "0.00", total: "170.00" });
+  assert.equal(discountWarning(d), null);
+  assert.equal(toPayPalItems(d)[0]?.unit_amount.value, "180.00");
+  assert.equal(toPayPalItems(d)[0]?.description, "10% off included");
+  assert.deepEqual(invoiceDiscount(d), { amount: { currency_code: "EUR", value: "10.00" } });
+});
+
+test("both discounts: taken off more than the subtotal is refused, so the total cannot go negative", () => {
+  const d = { customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discount: "150.00", discountPercent: "50",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }] };
+  assert.throws(() => totals(d), /larger than the subtotal/);
 });
 
 test("fixed: a share that cannot divide bakes by keeping the leftover cents on a quantity 1 line", () => {

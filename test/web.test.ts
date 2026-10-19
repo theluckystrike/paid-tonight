@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, POLL_ENDED_MESSAGE, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang } from "../web/app.js";
 import { totals } from "../src/money";
 import { validateDraft } from "../src/validate";
+import { extractDraft } from "../src/extract.js";
 import type { InvoiceDraft } from "../src/types";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
@@ -81,13 +82,18 @@ test("R10: the preview has a clearable discount percent field next to the amount
   assert.match(app, /discountInput\.addEventListener\("input",[\s\S]*?state\.draft\.discount[\s\S]*?sync\(\)/);
 });
 
-test("R10: a percent and a fixed amount that disagree warns in the preview and drops neither total", () => {
+test("R13: the preview bills a percent and a separate amount together, with no refusing warning", () => {
   const draft = {
     customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [],
     discount: "10.00", discountPercent: "10", items: [{ name: "Work", quantity: "1", unitAmount: "200" }],
   };
-  assert.ok(computeWarnings(draft).some((w) => w.includes("not both")), computeWarnings(draft).join(" | "));
-  assert.equal(computeTotals(draft).total, "200.00");
+  assert.ok(!computeWarnings(draft).some((w) => w.includes("not both")), computeWarnings(draft).join(" | "));
+  assert.equal(computeTotals(draft).discount, "30.00");
+  assert.equal(computeTotals(draft).total, "170.00");
+  const choice = discountChoice(draft);
+  assert.equal(choice.locked, false);
+  assert.equal(choice.draft.discount, "10.00");
+  assert.equal(choice.draft.discountPercent, "10");
 });
 
 test("R10: the browser computes the live German percentage case the way PayPal does", () => {
@@ -107,12 +113,12 @@ test("R10: the cash confirm shows the amount due", () => {
   assert.match(app, /Record \$\{amount\} as paid in cash/);
 });
 
-// A percent draft as the server returns it: the extracted fixed share sits next to the percent. Editing any number
-// makes the stale share disagree, which is the live 422 until the amount box is cleared.
+// A percent draft as the server returns it for a lone percent: no separate amount, so editing any number cannot
+// leave a stale amount behind.
 function percentDraft(): InvoiceDraft {
   return {
     customerName: "Herr Weber", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [],
-    discount: "147.83", discountPercent: "10",
+    discountPercent: "10",
     items: [
       { name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" },
       { name: "Heizung", quantity: "1", unitAmount: "1249.00" },
@@ -120,10 +126,18 @@ function percentDraft(): InvoiceDraft {
   };
 }
 
+// A draft that names both a percent and a separate amount: the percent bakes and the amount is taken at invoice level.
+function bothDraft(): InvoiceDraft {
+  return {
+    customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [],
+    discount: "5.00", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }],
+  };
+}
+
 test("R11: editing hours on a percent draft keeps one source of truth, so totals match and Send is accepted", () => {
   const draft = percentDraft();
   draft.items[0]!.quantity = "4";
-  assert.throws(() => validateDraft(draft));
   const choice = discountChoice(draft);
   assert.equal(choice.draft.discount, null);
   assert.equal(choice.draft.discountPercent, "10");
@@ -137,7 +151,6 @@ test("R11: editing hours on a percent draft keeps one source of truth, so totals
 test("R11: editing a unit price on a percent draft keeps one source of truth", () => {
   const draft = percentDraft();
   draft.items[1]!.unitAmount = "1199.00";
-  assert.throws(() => validateDraft(draft));
   const choice = discountChoice(draft);
   assert.equal(choice.draft.discount, null);
   assert.equal(choice.amount, computeTotals(choice.draft).discount);
@@ -148,7 +161,6 @@ test("R11: editing a unit price on a percent draft keeps one source of truth", (
 test("R11: editing the percent on a percent draft keeps one source of truth", () => {
   const draft = percentDraft();
   draft.discountPercent = "12";
-  assert.throws(() => validateDraft(draft));
   const choice = discountChoice(draft);
   assert.equal(choice.draft.discount, null);
   assert.equal(choice.amount, computeTotals(choice.draft).discount);
@@ -156,19 +168,53 @@ test("R11: editing the percent on a percent draft keeps one source of truth", ()
   assert.doesNotThrow(() => validateDraft(choice.draft));
 });
 
+test("R13: editing a number on a both-discounts draft keeps both, and the preview still equals the server", () => {
+  const draft = bothDraft();
+  draft.items[0]!.quantity = "2";
+  const choice = discountChoice(draft);
+  assert.equal(choice.locked, false);
+  assert.equal(choice.draft.discount, "5.00");
+  assert.equal(choice.draft.discountPercent, "10");
+  assert.deepEqual(computeTotals(choice.draft), totals(choice.draft));
+  assert.doesNotThrow(() => validateDraft(choice.draft));
+  assert.equal(validateDraft(choice.draft).discount, "5.00");
+});
+
+test("R13: the preview and /api/totals agree to the cent on a both-discounts draft", () => {
+  const draft = bothDraft();
+  const choice = discountChoice(draft);
+  const preview = computeTotals(choice.draft);
+  const server = totals(validateDraft(draft));
+  assert.deepEqual(preview, server);
+  assert.deepEqual(preview, { subtotal: "200.00", discount: "25.00", tax: "0.00", total: "175.00" });
+});
+
+test("R13: a both-discounts draft from the extractor keeps the preview and the server equal", async () => {
+  const json = JSON.stringify({
+    customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "19",
+    items: [{ name: "Arbeit", quantity: "1", unitAmount: "200", unit: "HOURS" }],
+    discount: "5", discountPercent: "10", note: null,
+  });
+  const draft = await extractDraft("Arbeit 200 Euro, 10 % Rabatt und minus 5 Euro", async () => json, "2026-10-17");
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discount, "5.00");
+  assert.equal(choice.draft.discountPercent, "10");
+  assert.deepEqual(computeTotals(choice.draft), totals(draft));
+  assert.deepEqual(computeTotals(choice.draft), totals(validateDraft(draft)));
+  assert.equal(computeTotals(choice.draft).total, "209.20");
+});
+
 test("R11: the amount box shows the computed discount, so the line never differs from the field by a cent", () => {
   const draft: InvoiceDraft = {
     customerName: "A", customerEmail: null, currency: "GBP", taxPercent: null, note: null, warnings: [],
-    discount: "0.05", discountPercent: "3",
+    discountPercent: "3",
     items: [
       { name: "Work", quantity: "1", unitAmount: "1" },
       { name: "Parts", quantity: "0.5", unitAmount: "1" },
     ],
   };
-  // The exact percent share is 0.05, the per line rounding makes the discount line 0.04: the old field showed 0.05.
+  // The exact percent share is 0.05, the per line rounding makes the discount line 0.04: the box shows the line value.
   assert.equal(totals(draft).discount, "0.04");
-  assert.equal(draft.discount, "0.05");
-  assert.notEqual(draft.discount, totals(draft).discount);
   const choice = discountChoice(draft);
   assert.equal(choice.draft.discount, null);
   assert.equal(choice.amount, "0.04");
