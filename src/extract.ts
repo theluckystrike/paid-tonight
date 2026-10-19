@@ -377,7 +377,8 @@ function percentFromText(text: string): string | null {
 const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
 const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dollars?|pounds?|zlotys?|złotych)`;
 // A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
-const MONEY_AMOUNT = String.raw`(\d+(?:[.,]\d{1,2})?)(?!\s*(?:%|percent|per cent))`;
+// The number is anchored on both sides, so backtracking cannot read the "1" of "rabat 15%" as an amount.
+const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))`;
 const AMOUNT_WITH_DISCOUNT = new RegExp(
   `${MONEY_AMOUNT}\\s*(?:${MONEY_CURRENCY})?\\s*(?:${DISCOUNT_AMOUNT_WORDS})\\b` +
   `|\\b(?:${DISCOUNT_AMOUNT_WORDS})\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(?:${MONEY_CURRENCY}\\s*)?${MONEY_AMOUNT}`,

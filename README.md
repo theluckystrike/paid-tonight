@@ -110,7 +110,7 @@ npx wrangler secret put DEMO_SEND_CODE        # optional, an access code for sen
 npx wrangler secret put ADMIN_CODE            # required only for the webhook setup route
 npx wrangler secret put PAYPAL_WEBHOOK_ID     # after the setup route returns the webhook id
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 220 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 221 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License
