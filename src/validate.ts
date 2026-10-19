@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { SUPPORTED } from "./extract.js";
 import type { InvoiceDraft } from "./types.js";
-import { BOTH_DISCOUNTS_WARNING, discountWarning, totals } from "./money.js";
+import { discountWarning, totals } from "./money.js";
 
 // Server-side check of a draft the user edited in the browser. Runs before anything is created or sent at PayPal.
 const money = z.string().trim().regex(/^\d{1,6}(\.\d{1,2})?$/, "must be an amount between 0 and 999999.99");
@@ -34,13 +34,13 @@ export function validateDraft(input: unknown): InvoiceDraft {
   const draft = { ...r.data, warnings: r.data.warnings ?? [] } as InvoiceDraft;
   let t: ReturnType<typeof totals>;
   try { t = totals(draft); } catch (err) { throw new DraftInvalid([err instanceof Error ? err.message : "totals failed"]); }
+  // A discount that would take off more than the work billed is refused, so the total can never go negative.
+  if (t.total.startsWith("-")) throw new DraftInvalid(["The discounts are larger than the work billed. Lower a discount and try again."]);
   // Same ceiling as extraction, so an edited draft cannot send what a fresh one would refuse.
   if (Number(t.total) >= 100_000) throw new DraftInvalid(["The total is above 100,000. Check the amounts and try again."]);
   // A zero total has nothing to pay, so PayPal must not be asked to invoice it.
   if (t.total === "0.00") throw new DraftInvalid(["The total is 0.00, so there is nothing to bill. Remove the discount or set a price."]);
   const warning = discountWarning(draft);
-  // A percent and a fixed amount that disagree is ambiguous, so refuse rather than silently drop one.
-  if (warning === BOTH_DISCOUNTS_WARNING) throw new DraftInvalid([BOTH_DISCOUNTS_WARNING]);
   if (warning && !draft.warnings.includes(warning)) draft.warnings.push(warning);
   return draft;
 }

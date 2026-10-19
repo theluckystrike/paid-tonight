@@ -55,8 +55,13 @@ function makeDraft(next: () => number): InvoiceDraft {
   } else if (mode === 2) {
     draft.discountPercent = (Math.floor(next() * 10001) / 100).toFixed(2);
   } else if (mode === 3) {
-    draft.discount = subtotal > 0n ? cents(BigInt(Math.floor(next() * Number(subtotal + 1n)))) : "0.00";
-    draft.discountPercent = (Math.floor(next() * 10001) / 100).toFixed(2);
+    // A percent plus a separate fixed amount. The amount stays within what is left after the percent, so together
+    // they never take off more than the subtotal and both the browser and the server keep the same plan.
+    const hundredths = BigInt(Math.floor(next() * 10001));
+    draft.discountPercent = (Number(hundredths) / 100).toFixed(2);
+    const share = (subtotal * hundredths + 5000n) / 10000n;
+    const remaining = subtotal > share ? subtotal - share : 0n;
+    draft.discount = remaining > 0n ? cents(BigInt(Math.floor(next() * Number(remaining + 1n)))) : "0.00";
   }
   return draft;
 }

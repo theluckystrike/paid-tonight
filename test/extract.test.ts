@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extractDraft, type AiRunner } from "../src/extract.js";
-import { totals } from "../src/money";
+import { INVOICE_DISCOUNT_WARNING, totals } from "../src/money";
 import { ExtractError } from "../src/types.js";
 
 type Messages = { role: string; content: string }[];
@@ -406,39 +406,85 @@ test("R13: a percent written after a discount word is never read as a second amo
   }
 });
 
-test("R12: a text that names both a percent and a fixed amount gives one clear warning", async () => {
-  const text = "2 hours at 50 for Ola, 10 percent off and another 5 euro off";
+test("R14: a percent and a separate fixed amount in the text are both billed, 18.00 off and 138.91", async () => {
+  const text = "130 euro for Ola, 10 percent off and another 5 euro off";
   const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "5", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "130" }], taxPercent: "23" })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, "5.00");
+  assert.deepEqual(totals(draft), { subtotal: "130.00", discount: "18.00", tax: "26.91", total: "138.91" });
+  assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("5.00") && w.includes("18.00")), draft.warnings.join(" | "));
+  // The fixed part is taken by PayPal after tax, so the draft carries the after tax warning.
+  assert.ok(draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+});
+
+test("R14: a percent and a separate fixed amount in the text are both billed, Polish", async () => {
+  // The amount is 30, not the 20 percent share, so it is a real second discount rather than an echo.
+  const text = "Naprawa u Oli, 2 godziny po 100, rabat 10% i jeszcze 30 z\u0142 mniej";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "PLN", discount: "30", discountPercent: "10",
+    items: [{ name: "Robota", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, "30.00");
+  assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "50.00", tax: "0.00", total: "150.00" });
+  assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("30.00") && w.includes("50.00")), draft.warnings.join(" | "));
+});
+
+test("R14: a percent and a separate fixed amount in the text are both billed, German, with tax", async () => {
+  const text = "Arbeit bei Herrn Weber, 200 Euro, 10 % Rabatt und minus 5 Euro";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "5", discountPercent: "10",
+    items: [{ name: "Arbeit", quantity: "1", unitAmount: "200", unit: "HOURS" }], taxPercent: "19" })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, "5.00");
+  // The percent bakes, tax is charged on 180.00 and the 5.00 is taken at invoice level: 180.00 + 34.20 - 5.00.
+  assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "25.00", tax: "34.20", total: "209.20" });
+  assert.ok(draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+});
+
+test("R14: discounts that together exceed the work billed are refused", async () => {
+  const text = "2 hours at 200 for Ola, 50 percent off and another 150 euro off";
+  await assert.rejects(extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "150", discountPercent: "50",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY), /larger than the work/);
+});
+
+test("R14: the German regression, a model echo of a rounded share is not a second discount", async () => {
+  // The model repeats a rounded percent share (148.00) in the amount field, but the text names no amount, so nothing
+  // is added at invoice level and the total stays 1583.21.
+  const text = "Arbeit bei Herrn Weber, 3,5 Std. \u00e0 65,50 \u20ac, Heizung 1249,00 \u20ac, 19 % MwSt., 10 % Rabatt";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: "148.00", discountPercent: "10",
+    items: [{ name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" }, { name: "Heizung", quantity: "1", unitAmount: "1249.00" }] })), TODAY);
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(totals(draft).discount, "147.82");
+  assert.equal(totals(draft).total, "1583.21");
+  assert.ok(!draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+});
+
+test("R14: a number followed by an item unit is not read as a discount amount", async () => {
+  // "2 hours" is a quantity, not money, so the model's echo of 2 is not a second discount.
+  const text = "Fixed a leak for Ola, 10% off 2 hours, work 200";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "2", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
   assert.equal(draft.discount, undefined);
   assert.equal(draft.discountPercent, "10");
-  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
-  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
-  assert.ok(aboutDiscount[0]!.includes("10%"));
-  assert.ok(aboutDiscount[0]!.includes("5.00"));
-  assert.ok(aboutDiscount[0]!.includes("20.00"));
+  assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" });
 });
 
-test("R10: a percent and a currency amount named in the text warn even when the amount is the percent share", async () => {
-  // The model repeats the percent share (20.00) in the amount field, but the text still names both discounts.
+test("R14: a model amount within 1.00 of the percent share is an echo, never a second discount", async () => {
+  // The text names 20 euro off, which happens to equal the 10 percent share of 200. It is the share echoed back.
   const draft = await extractDraft("2 hours at 100 for Ola, 10 percent off and 20 euro off", aiOnce(draftJson({ currency: "EUR", discount: "20.00", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
   assert.equal(draft.discount, undefined);
   assert.equal(draft.discountPercent, "10");
-  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
-  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
-  assert.ok(aboutDiscount[0]!.includes("10%"));
-  assert.ok(aboutDiscount[0]!.includes("20.00"));
+  assert.equal(totals(draft).total, "180.00");
 });
 
-test("R10: the same rule sees a word such as mniej or minus next to the amount", async () => {
-  for (const text of ["2 hours at 100, 10 % Rabatt und 20 euro mniej", "2 hours at 100, 10 percent off and minus 20 discount"]) {
-    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "20.00", discountPercent: "10",
+test("R14: the same rule sees a word such as mniej or minus next to a separate amount", async () => {
+  for (const text of ["2 hours at 100, 10 % Rabatt und 30 euro mniej", "2 hours at 100, 10 percent off and minus 30 discount"]) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "30.00", discountPercent: "10",
       items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
     assert.equal(draft.discountPercent, "10", text);
-    const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
-    assert.equal(aboutDiscount.length, 1, `${text}: ${aboutDiscount.join(" | ")}`);
-    assert.ok(aboutDiscount[0]!.includes("20.00"), text);
+    assert.equal(draft.discount, "30.00", text);
+    assert.equal(totals(draft).discount, "50.00", text);
   }
 });
 

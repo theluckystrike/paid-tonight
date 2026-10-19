@@ -63,18 +63,19 @@ function makeDraft(next: () => number): InvoiceDraft {
     note: null,
     warnings: [],
   };
-  const mode = Math.floor(next() * 5);
+  const mode = Math.floor(next() * 4);
   if (mode === 1) {
     draft.discountPercent = (Math.floor(next() * 10001) / 100).toFixed(2);
   } else if (mode === 2) {
     draft.discount = subtotal > 0n ? cents(BigInt(Math.floor(next() * Number(subtotal + 1n)))) : "0.00";
   } else if (mode === 3) {
-    draft.discount = subtotal > 0n ? cents(BigInt(Math.floor(next() * Number(subtotal + 1n)))) : "0.00";
-    draft.discountPercent = (Math.floor(next() * 10001) / 100).toFixed(2);
-  } else if (mode === 4) {
+    // A percent plus a separate fixed amount: the percent bakes and the amount is taken at invoice level. The amount
+    // stays within what is left after the percent, so together they never take off more than the subtotal.
     const hundredths = BigInt(Math.floor(next() * 10001));
     draft.discountPercent = (Number(hundredths) / 100).toFixed(2);
-    draft.discount = cents((subtotal * hundredths + 5000n) / 10000n);
+    const share = (subtotal * hundredths + 5000n) / 10000n;
+    const remaining = subtotal > share ? subtotal - share : 0n;
+    draft.discount = remaining > 0n ? cents(BigInt(Math.floor(next() * Number(remaining + 1n)))) : "0.00";
   }
   return draft;
 }
@@ -97,6 +98,25 @@ test("our total equals a PayPal simulation on 5,000 random drafts with fractiona
   assert.ok(percent > 1000, `percent drafts: ${percent}`);
   assert.ok(fallback > 200, `fallback drafts: ${fallback}`);
   assert.ok(baked > 1000, `baked drafts: ${baked}`);
+});
+
+test("R13: a percent plus a separate fixed amount matches the PayPal simulation and carries both", () => {
+  const draft: InvoiceDraft = {
+    customerName: "Herr Weber",
+    customerEmail: null,
+    currency: "EUR",
+    taxPercent: "19",
+    discount: "5.00",
+    discountPercent: "10",
+    note: null,
+    warnings: [],
+    items: [{ name: "Arbeit", quantity: "1", unitAmount: "200.00", unit: "HOURS" }],
+  };
+  const ours = totals(draft);
+  assert.deepEqual(ours, { subtotal: "200.00", discount: "25.00", tax: "34.20", total: "209.20" });
+  assert.equal(toPayPalItems(draft)[0]!.unit_amount.value, "180.00");
+  assert.equal(invoiceDiscount(draft)?.amount.value, "5.00");
+  assert.equal(simulatePayPal(toPayPalItems(draft), invoiceDiscount(draft)?.amount.value ?? null), "209.20");
 });
 
 test("the live German case: 3.5 hours at 65.50 and a 1249.00 part, 10 percent off, 19 percent VAT", () => {

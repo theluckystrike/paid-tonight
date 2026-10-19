@@ -1,5 +1,5 @@
 import { z, type ZodError } from "zod";
-import { totals } from "./money.js";
+import { INVOICE_DISCOUNT_WARNING, totals } from "./money.js";
 import { needsNameCheck, stripHonorific } from "./names.js";
 import { ExtractError } from "./types.js";
 import type { AiRunner, InvoiceDraft, LineItem } from "./types.js";
@@ -376,9 +376,12 @@ function percentFromText(text: string): string | null {
 // even when the model repeats only the percent share in its amount field.
 const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
 const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dollars?|pounds?|zlotys?|złotych)`;
+// An item word or a unit directly after a number makes it a quantity, not money, so "2 hours", "3 sockets", "10 m",
+// "5 szt" or "4 Stunden" is never read as a discount amount. Longer words come first so a prefix cannot win.
+const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|min(?:utes?|uten)?|metres?|meters?|kilometres?|kilometers?|kgs?|ml|cm|mm|km|kg|m|g|l)`;
 // A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
 // The number is anchored on both sides, so backtracking cannot read the "1" of "rabat 15%" as an amount.
-const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))`;
+const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))(?!\s*(?:${ITEM_WORD})\b)`;
 const AMOUNT_WITH_DISCOUNT = new RegExp(
   `${MONEY_AMOUNT}\\s*(?:${MONEY_CURRENCY})?\\s*(?:${DISCOUNT_AMOUNT_WORDS})\\b` +
   `|\\b(?:${DISCOUNT_AMOUNT_WORDS})\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(?:${MONEY_CURRENCY}\\s*)?${MONEY_AMOUNT}`,
@@ -429,28 +432,34 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
 
   let appliedPercent: string | null = null;
   let extraFixed = 0n;
+  // A second fixed amount is billed only when the description itself names it and the model's amount is that same
+  // figure. A model often repeats the percent number, the percent share or the discount the percent bakes in its
+  // amount field; any of those within 1.00 is an echo, never a second discount.
+  const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
   if (percentValue != null) {
     const hundredths = scaleRound(percentValue, 2);
     if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
       appliedPercent = percentValue;
-      // A percent wins: the draft carries the percent alone, so no stale amount can block a later total. The amount box
-      // in the preview shows the discount the server computes, read-only.
       draft.discountPercent = appliedPercent;
       const share = (subtotal * hundredths + 5000n) / 10000n;
       const bakedFixed = scaleRound(totals(draft).discount, 2) ?? 0n;
-      // A model may repeat the percent number, the computed share or the baked discount in the fixed field; none is a second discount.
-      if (fixedDiscount > 0n && fixedDiscount !== hundredths && fixedDiscount !== share && fixedDiscount !== bakedFixed) extraFixed = fixedDiscount;
+      const off = (target: bigint) => (fixedDiscount > target ? fixedDiscount - target : target - fixedDiscount);
+      const isEcho = off(hundredths) <= 100n || off(share) <= 100n || off(bakedFixed) <= 100n;
+      if (namedAmount > 0n && fixedDiscount === namedAmount && !isEcho) extraFixed = fixedDiscount;
     }
   }
   if (appliedPercent != null) {
-    const baked = totals(draft).discount;
-    // The text itself may name a currency amount next to a discount word, even when the model's amount is the percent share.
-    const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
-    const bothAmount = extraFixed > 0n ? extraFixed : namedAmount;
-    if (bothAmount > 0n) {
-      // One clear message instead of both an "applied" line and a mismatch line that contradict each other.
-      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(bothAmount)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
+    if (extraFixed > 0n) {
+      // The text names both a percent and a separate fixed amount, so both come off: the percent bakes into the unit
+      // prices and the fixed amount is added at invoice level, after tax. Refuse when together they would take off
+      // more than the work billed, the same way a lone fixed discount is refused.
+      draft.discount = formatMoney(extraFixed);
+      let plan: ReturnType<typeof totals>;
+      try { plan = totals(draft); } catch { throw new ExtractError("The discounts are larger than the work billed."); }
+      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(extraFixed)} amount, so ${plan.discount} comes off in total`);
+      warnings.push(INVOICE_DISCOUNT_WARNING);
     } else {
+      const baked = totals(draft).discount;
       warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
       if (textPercent != null) {
         const textPercentValue = formatPercent(textPercent);
