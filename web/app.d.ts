@@ -32,6 +32,8 @@ export function computeWarnings(draft: {
 
 export function discountChoice(draft: InvoiceDraft): { draft: InvoiceDraft; amount: string; locked: boolean };
 
+export const DISCOUNT_REFUSED_MESSAGE: string;
+
 export function localDay(date: Date | string | number): string | null;
 
 export function paidTodayFor<T extends { at?: string | null }>(records: T[], now?: Date | string | number): T[];

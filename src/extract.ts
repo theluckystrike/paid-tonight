@@ -377,8 +377,9 @@ function percentFromText(text: string): string | null {
 const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
 const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dollars?|pounds?|zlotys?|złotych)`;
 // An item word or a unit directly after a number makes it a quantity, not money, so "2 hours", "3 sockets", "10 m",
-// "5 szt" or "4 Stunden" is never read as a discount amount. Longer words come first so a prefix cannot win.
-const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|min(?:utes?|uten)?|metres?|meters?|kilometres?|kilometers?|kgs?|ml|cm|mm|km|kg|m|g|l)`;
+// "5 szt", "4 Stunden" or "30 mins" is never read as a discount amount. Longer words come first so a prefix cannot win,
+// and the single letters m, g and l match a whole word (m\w* etc), so "2 litres" and "5 grams" are quantities too.
+const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|minutes?|minuten?|mins?|seconds?|secs?|tonnes?|box(?:es)?|bags?|litres?|liters?|grams?|metres?|meters?|kilometres?|kilometers?|visits?|rooms?|days?|kgs?|ml|cm|mm|km|kg|m\w*|g\w*|l\w*)`;
 // A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
 // The number is anchored on both sides, so backtracking cannot read the "1" of "rabat 15%" as an amount.
 const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))(?!\s*(?:${ITEM_WORD})\b)`;
@@ -432,20 +433,17 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
 
   let appliedPercent: string | null = null;
   let extraFixed = 0n;
-  // A second fixed amount is billed only when the description itself names it and the model's amount is that same
-  // figure. A model often repeats the percent number, the percent share or the discount the percent bakes in its
-  // amount field; any of those within 1.00 is an echo, never a second discount.
+  // A second fixed amount is billed whenever the description itself writes that amount next to a discount word and the
+  // model returns the same figure, even when it lands on the percent share or the discount the percent bakes in. The
+  // echo test is left for a description that names no amount: a model often repeats the percent number, the percent
+  // share or the baked discount in its amount field, and none of those is a second discount.
   const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
   if (percentValue != null) {
     const hundredths = scaleRound(percentValue, 2);
     if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
       appliedPercent = percentValue;
       draft.discountPercent = appliedPercent;
-      const share = (subtotal * hundredths + 5000n) / 10000n;
-      const bakedFixed = scaleRound(totals(draft).discount, 2) ?? 0n;
-      const off = (target: bigint) => (fixedDiscount > target ? fixedDiscount - target : target - fixedDiscount);
-      const isEcho = off(hundredths) <= 100n || off(share) <= 100n || off(bakedFixed) <= 100n;
-      if (namedAmount > 0n && fixedDiscount === namedAmount && !isEcho) extraFixed = fixedDiscount;
+      if (namedAmount > 0n && fixedDiscount === namedAmount) extraFixed = fixedDiscount;
     }
   }
   if (appliedPercent != null) {
@@ -461,8 +459,8 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
     } else {
       const baked = totals(draft).discount;
       if (namedAmount > 0n) {
-        // The text names an amount but the model left its fixed field empty, different or an echo, so only the percent
-        // is billed. Name the ignored amount so the seller checks whether a second discount was meant.
+        // The text names an amount but the model left its fixed field empty or different, so only the percent is
+        // billed. Name the ignored amount so the seller checks whether a second discount was meant.
         warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(namedAmount)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
       } else {
         warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);

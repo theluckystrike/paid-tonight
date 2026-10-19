@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, POLL_ENDED_MESSAGE, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, POLL_ENDED_MESSAGE, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang, DISCOUNT_REFUSED_MESSAGE } from "../web/app.js";
 import { totals } from "../src/money";
 import { validateDraft } from "../src/validate";
 import { extractDraft } from "../src/extract.js";
@@ -202,6 +202,32 @@ test("R13: a both-discounts draft from the extractor keeps the preview and the s
   assert.deepEqual(computeTotals(choice.draft), totals(draft));
   assert.deepEqual(computeTotals(choice.draft), totals(validateDraft(draft)));
   assert.equal(computeTotals(choice.draft).total, "209.20");
+});
+
+test("R15: editing the amount on a both-discounts draft keeps the percent, and the percent box follows state", () => {
+  const draft = bothDraft();
+  // The amount box handler sets the new amount while the draft arrived with both a percent and an amount.
+  draft.discount = "6.00";
+  const choice = discountChoice(draft);
+  assert.equal(choice.draft.discountPercent, "10");
+  assert.equal(choice.draft.discount, "6.00");
+  assert.deepEqual(computeTotals(choice.draft), totals(draft));
+  // The handler keeps the percent for a draft that arrived with both, and sync writes the percent box from state.
+  assert.match(app, /discountInput\.addEventListener\("input",[\s\S]*?!keepPercent[\s\S]*?state\.draft\.discountPercent = null/);
+  assert.match(app, /discountPercentInput\.value = hasValue\(state\.draft\.discountPercent\)/);
+});
+
+test("R15: the preview refuses a combined discount the server would refuse, with the server message", () => {
+  const draft = {
+    customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [],
+    discount: "150.00", discountPercent: "50",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }],
+  };
+  // The server throws on this pair, so a capped 0.00 total would look valid and only fail at the send step.
+  assert.throws(() => totals(draft), /larger than the subtotal/);
+  assert.ok(computeWarnings(draft).includes(DISCOUNT_REFUSED_MESSAGE), computeWarnings(draft).join(" | "));
+  assert.notEqual(computeTotals(draft).total, "0.00");
+  assert.match(app, /DISCOUNT_REFUSED_MESSAGE/);
 });
 
 test("R11: the amount box shows the computed discount, so the line never differs from the field by a cent", () => {

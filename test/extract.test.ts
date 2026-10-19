@@ -482,13 +482,36 @@ test("R14: a number followed by an item unit is not read as a discount amount", 
   assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" });
 });
 
-test("R14: a model amount within 1.00 of the percent share is an echo, never a second discount", async () => {
-  // The text names 20 euro off, which happens to equal the 10 percent share of 200. It is the share echoed back.
+test("R15: a number before mins, seconds and the other unit words is a quantity, not money", async () => {
+  for (const unit of ["mins", "min", "sec", "secs", "seconds", "boxes", "box", "bags", "litres", "liters", "grams", "tonnes", "days", "visits", "rooms", "m", "g", "l"]) {
+    const text = `Fixed, 10% off 30 ${unit} labour, work 200`;
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "30", discountPercent: "10",
+      items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discount, undefined, text);
+    assert.equal(draft.discountPercent, "10", text);
+    assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" }, text);
+  }
+});
+
+test("R15: an amount the description names next to a discount word is billed even when it equals the percent share", async () => {
+  // The text names 20 euro off, which equals the 10 percent share of 200. The description writes it next to a discount
+  // word, so it is a real second discount, never an echo.
   const draft = await extractDraft("2 hours at 100 for Ola, 10 percent off and 20 euro off", aiOnce(draftJson({ currency: "EUR", discount: "20.00", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
-  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discount, "20.00");
   assert.equal(draft.discountPercent, "10");
-  assert.equal(totals(draft).total, "180.00");
+  assert.equal(totals(draft).discount, "40.00");
+  assert.equal(totals(draft).total, "160.00");
+});
+
+test("R15: the review case, a named amount that lands on the percent share is still a second discount", async () => {
+  const text = "500 euro work, rabat 10% i 50 euro mniej";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "50", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "500" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, "50.00");
+  assert.deepEqual(totals(draft), { subtotal: "500.00", discount: "100.00", tax: "0.00", total: "400.00" });
+  assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("50.00") && w.includes("100.00")), draft.warnings.join(" | "));
 });
 
 test("R14: the same rule sees a word such as mniej or minus next to a separate amount", async () => {

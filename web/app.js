@@ -86,6 +86,10 @@ function lineCentsFor(qScaled, unitCents) {
 
 const INVOICE_DISCOUNT_WARNING = "PayPal applies this discount after tax, so VAT is charged on the full price";
 
+// The server refuses a pair of discounts that together take off more than the work billed. The preview shows this
+// same message instead of a total, so a draft the server would reject never looks valid in the browser.
+const DISCOUNT_REFUSED_MESSAGE = "The discounts are larger than the work billed.";
+
 function gcd(a, b) {
   while (b > 0n) {
     const t = a % b;
@@ -214,15 +218,20 @@ function discountPlan(draft) {
     const plan = percentPlan(lines, unitCents, qScaled, pct, percent);
     if (fixed != null) {
       // A percent and a separate amount are both billed: the percent bakes into the unit prices and the amount goes
-      // to PayPal at invoice level, after tax, so the preview warns. The preview caps the amount at what is left, so
-      // its total can never go negative; the server refuses a draft where the two together take off more.
+      // to PayPal at invoice level, after tax, so the preview warns. When the two together take off more than the
+      // subtotal the server refuses the draft, so the preview refuses it too instead of capping it into a valid total.
       const fixedCents = scaledDecimal(fixed, 2);
-      const remaining = subtotal > plan.totalDiscount ? subtotal - plan.totalDiscount : 0n;
-      const fixedPart = fixedCents > remaining ? remaining : fixedCents;
+      if (plan.totalDiscount + fixedCents > subtotal) {
+        return {
+          lines: plan.lines, unitCents: plan.unitCents, lineDiscount: plan.lineDiscount,
+          totalDiscount: plan.totalDiscount + fixedCents, baked: plan.baked, percent: plan.percent,
+          warning: INVOICE_DISCOUNT_WARNING, refused: true,
+        };
+      }
       return {
         lines: plan.lines, unitCents: plan.unitCents, lineDiscount: plan.lineDiscount,
-        totalDiscount: plan.totalDiscount + fixedPart, baked: plan.baked, percent: plan.percent,
-        warning: INVOICE_DISCOUNT_WARNING,
+        totalDiscount: plan.totalDiscount + fixedCents, baked: plan.baked, percent: plan.percent,
+        warning: INVOICE_DISCOUNT_WARNING, refused: false,
       };
     }
     return plan;
@@ -254,8 +263,8 @@ function computeTotals(draft) {
 
 // The preview keeps one source of truth for the discount. A lone percent shows its computed discount in the amount
 // box, read only. When the description named both a percent and a separate amount, both are billed: the percent bakes
-// and the amount goes at invoice level, and the amount box stays editable so the seller can change or clear it.
-// Typing an amount with no percent clears the percent. The server runs the same discountPlan, so the totals stay equal.
+// and the amount goes at invoice level, and the amount box stays editable so the seller can change or clear it, while
+// the percent stays. The server runs the same discountPlan, so the totals stay equal.
 function discountChoice(draft) {
   const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "";
   if (!percent) return { draft: { ...draft, discountPercent: null }, amount: draft.discount || "", locked: false };
@@ -371,6 +380,11 @@ function reminderMailto(invoice, subject, note) {
 
 function asText(value, fallback) {
   return value == null ? fallback : String(value);
+}
+
+// A discount field counts as set only when it carries a non blank value.
+function hasValue(value) {
+  return value != null && String(value).trim() !== "";
 }
 
 function currencyOf(value) {
@@ -576,6 +590,7 @@ function friendlyMessage(err) {
 function computeWarnings(draft) {
   const warnings = [];
   const plan = discountPlan(draft);
+  if (plan.refused) warnings.push(DISCOUNT_REFUSED_MESSAGE);
   if (plan.warning) warnings.push(plan.warning);
   // A percent above 100 is clamped for the totals, and the field says why instead of a negative total.
   const percent = draft.discountPercent == null ? NaN : Number(String(draft.discountPercent).trim());
@@ -671,13 +686,19 @@ function totalsLine(label, amount, strong) {
 }
 
 function renderTotals(box, warningsBox) {
-  const totals = state.totals || computeTotals(state.draft);
-  box.replaceChildren();
-  box.append(totalsLine("Subtotal", totals.subtotal, false));
-  if (totals.discount && totals.discount !== "0.00") box.append(totalsLine("Discount", "-" + totals.discount, false));
-  box.append(totalsLine("Tax", totals.tax, false));
-  box.append(totalsLine("Total", totals.total, true));
   const warnings = dedupeWarnings(state.draft.warnings || [], computeWarnings(state.draft));
+  box.replaceChildren();
+  // The server refuses this pair, so show the refusal instead of a total. A capped total would look valid and only
+  // fail at the send step.
+  if (discountPlan(state.draft).refused) {
+    box.append(el("p", "totals__refused", DISCOUNT_REFUSED_MESSAGE));
+  } else {
+    const totals = state.totals || computeTotals(state.draft);
+    box.append(totalsLine("Subtotal", totals.subtotal, false));
+    if (totals.discount && totals.discount !== "0.00") box.append(totalsLine("Discount", "-" + totals.discount, false));
+    box.append(totalsLine("Tax", totals.tax, false));
+    box.append(totalsLine("Total", totals.total, true));
+  }
   renderWarnings(warningsBox, warnings);
 }
 
@@ -793,11 +814,17 @@ function buildPreview(ui) {
     actionsEl([backBtn, sendBtn]),
   );
 
+  // A draft that arrived with both a percent and a separate amount keeps its percent when the seller edits the
+  // amount. A draft that arrived with no percent has nothing to keep, so typing an amount leaves the percent empty.
+  const keepPercent = hasValue(state.draft.discount) && hasValue(state.draft.discountPercent);
+
   const sync = () => {
     const choice = discountChoice(state.draft);
     state.draft = choice.draft;
     discountInput.readOnly = choice.locked;
     if (choice.locked || !state.draft.discount) discountInput.value = choice.amount;
+    // The percent box always follows state, so it can never show a value the draft does not carry.
+    discountPercentInput.value = hasValue(state.draft.discountPercent) ? String(state.draft.discountPercent) : "";
     state.totals = computeTotals(state.draft);
     renderTotals(totalsBox, warningsBox);
   };
@@ -814,7 +841,7 @@ function buildPreview(ui) {
   currencySelect.addEventListener("change", () => { state.draft.currency = currencySelect.value; sync(); });
   discountInput.addEventListener("input", () => {
     state.draft.discount = discountInput.value.trim() || null;
-    if (state.draft.discount != null) state.draft.discountPercent = null;
+    if (state.draft.discount != null && !keepPercent) state.draft.discountPercent = null;
     sync();
   });
   discountPercentInput.addEventListener("input", () => {
@@ -1394,6 +1421,7 @@ export {
   lineTotalCents,
   computeTotals,
   discountChoice,
+  DISCOUNT_REFUSED_MESSAGE,
   centsToStr,
   decimalText,
   moneyText,
