@@ -524,6 +524,27 @@ test("R14: the same rule sees a word such as mniej or minus next to a separate a
   }
 });
 
+test("R15: mniej and less are discount words, not the m and l units, so the named 50 is billed", async () => {
+  for (const text of ["Work 500 for Ola, 10% off and 50 mniej", "Work 500 for Ola, 10 percent off and 50 less"]) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "50", discountPercent: "10",
+      items: [{ name: "Work", quantity: "1", unitAmount: "500" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discountPercent, "10", text);
+    assert.equal(draft.discount, "50.00", text);
+    assert.deepEqual(totals(draft), { subtotal: "500.00", discount: "100.00", tax: "0.00", total: "400.00" }, text);
+    assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("50.00") && w.includes("100.00")), text + " | " + draft.warnings.join(" | "));
+  }
+});
+
+test("R15: the bare m and l units still make 50 m and 30 mins quantities", async () => {
+  for (const text of ["Fixed, 10% off 50 m of cable, work 200", "Fixed, 10% off 30 mins labour, work 200"]) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "50", discountPercent: "10",
+      items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discount, undefined, text);
+    assert.equal(draft.discountPercent, "10", text);
+    assert.deepEqual(totals(draft), { subtotal: "200.00", discount: "20.00", tax: "0.00", total: "180.00" }, text);
+  }
+});
+
 test("R10: a lone percent with no currency amount keeps the single applied warning", async () => {
   const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: null, discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);

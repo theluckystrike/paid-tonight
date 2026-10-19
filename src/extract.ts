@@ -377,9 +377,10 @@ function percentFromText(text: string): string | null {
 const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
 const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dollars?|pounds?|zlotys?|złotych)`;
 // An item word or a unit directly after a number makes it a quantity, not money, so "2 hours", "3 sockets", "10 m",
-// "5 szt", "4 Stunden" or "30 mins" is never read as a discount amount. Longer words come first so a prefix cannot win,
-// and the single letters m, g and l match a whole word (m\w* etc), so "2 litres" and "5 grams" are quantities too.
-const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|minutes?|minuten?|mins?|seconds?|secs?|tonnes?|box(?:es)?|bags?|litres?|liters?|grams?|metres?|meters?|kilometres?|kilometers?|visits?|rooms?|days?|kgs?|ml|cm|mm|km|kg|m\w*|g\w*|l\w*)`;
+// "5 szt", "4 Stunden" or "30 mins" is never read as a discount amount. Longer words come first so a prefix cannot win.
+// The single letters m, g and l are bare: the word boundary after the unit makes "50 m" a quantity while "50 mniej",
+// "50 less" or "50 lower" stays a discount amount, so no entry may swallow a word from DISCOUNT_AMOUNT_WORDS.
+const ITEM_WORD = String.raw`(?:hours?|hrs?|stunden?|std|godzin\w*|godz\w*|horas?|heures?|uur|sockets?|gniazd\w*|szt(?:uk\w*)?|pieces?|st(?:ü|ue)ck|stk|pcs|units?|items?|minutes?|minuten?|mins?|seconds?|secs?|tonnes?|box(?:es)?|bags?|litres?|liters?|grams?|metres?|meters?|kilometres?|kilometers?|visits?|rooms?|days?|kgs?|ml|cm|mm|km|kg|m|g|l)`;
 // A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
 // The number is anchored on both sides, so backtracking cannot read the "1" of "rabat 15%" as an amount.
 const MONEY_AMOUNT = String.raw`(?<![\d.,])(\d+(?:[.,]\d{1,2})?)(?![\d.,])(?!\s*(?:%|percent|per cent))(?!\s*(?:${ITEM_WORD})\b)`;
