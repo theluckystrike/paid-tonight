@@ -46,3 +46,13 @@ test("a fixed discount that matches the percent share is accepted", () => {
   const draft = validateDraft(both);
   assert.equal(totals(draft).total, "180.00");
 });
+
+test("R10: an amount equal to the baked discount is accepted next to the percent", () => {
+  // Per line rounding bakes 0.04, while the unbaked 3 percent share is 0.05. The read-only preview box shows 0.04.
+  const draft = { ...base, currency: "GBP", discount: "0.04", discountPercent: "3",
+    items: [{ name: "Work", quantity: "1", unitAmount: "1" }, { name: "Parts", quantity: "0.5", unitAmount: "1" }] };
+  assert.equal(totals(draft).discount, "0.04");
+  const ok = validateDraft(draft);
+  assert.equal(ok.discountPercent, "3");
+  assert.equal(totals(ok).total, "1.46");
+});

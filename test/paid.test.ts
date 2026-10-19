@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { dayKeyInTimeZone } from "../src/worker.js";
+import worker, { dayKeyInTimeZone, paidDayWindow } from "../src/worker.js";
 
 interface InvoiceRow {
   id: string;
@@ -49,7 +49,8 @@ function fakePayPal(opts: { verify?: string; verifyError?: boolean; verify4xx?: 
     }
     if (u.pathname === "/v1/notifications/webhooks" && method === "POST") return Response.json({ id: "WH-NEW" }, { status: 201 });
     if (u.pathname === "/v2/invoicing/invoices" && method === "GET") return Response.json({ items: [...invoices.values()] });
-    const m = /^\/v2\/invoicing\/invoices\/([^/]+)(?:\/(payments|send|generate-qr-code|remind))?$/.exec(u.pathname);
+    const m = /^\/v2\/invoicing\/invoices\/([^/]+)(?:\/(payments|send|generate-qr-code|remind|cancel))?$/.exec(u.pathname);
+    if (m && m[2] === "cancel") return new Response(null, { status: 204 });
     const inv = m ? invoices.get(decodeURIComponent(m[1]!)) : undefined;
     if (!m || !inv) return Response.json({ name: "RESOURCE_NOT_FOUND" }, { status: 404 });
     if (m[2] === "payments") {
@@ -112,8 +113,10 @@ function event(id: string, type: string, row: InvoiceRow) {
 
 const realFetch = globalThis.fetch;
 test.afterEach(() => { globalThis.fetch = realFetch; });
-/** The Warsaw calendar day, matching the worker's Paid today key and cash payment date. */
+/** The Warsaw calendar day, matching the worker's cash payment date. */
 const DAY = () => dayKeyInTimeZone(new Date(), "Europe/Warsaw");
+/** The UTC calendar day, the key paid records are stored under. */
+const UTC_DAY = () => dayKeyInTimeZone(new Date(), "UTC");
 
 test("R12: the Paid today day key is the Warsaw date, including a Warsaw evening that crosses UTC midnight", () => {
   // 22:30 UTC on 18 October is 00:30 on 19 October in Warsaw (CEST, UTC+2).
@@ -124,6 +127,32 @@ test("R12: the Paid today day key is the Warsaw date, including a Warsaw evening
   assert.equal(dayKeyInTimeZone(new Date("2026-12-31T23:30:00Z"), "Europe/Warsaw"), "2027-01-01");
   // A UTC clock would call the first case the day before, which is the bug this fixes.
   assert.equal(dayKeyInTimeZone(new Date("2026-10-18T22:30:00Z"), "UTC"), "2026-10-18");
+});
+
+test("R10: the paid day window covers a Pacific evening at 16:00 and a Warsaw midnight at 00:30", () => {
+  // 16:00 in Pacific is 23:00 UTC on the same UTC day.
+  const pacific = new Date("2026-10-18T16:00:00-07:00");
+  assert.equal(dayKeyInTimeZone(pacific, "America/Los_Angeles"), "2026-10-18");
+  assert.deepEqual(paidDayWindow(pacific), ["2026-10-18", "2026-10-17"]);
+  // 00:30 in Warsaw is 22:30 UTC the day before, so the UTC window still covers the local day.
+  const warsaw = new Date("2026-10-19T00:30:00+02:00");
+  assert.equal(dayKeyInTimeZone(warsaw, "Europe/Warsaw"), "2026-10-19");
+  assert.deepEqual(paidDayWindow(warsaw), ["2026-10-18", "2026-10-17"]);
+});
+
+test("R10: paid records are stored under the UTC day and the API returns the last two UTC days", async () => {
+  const pp = fakePayPal();
+  const limits = kv();
+  const base = { number: "x", status: "PAID", customerName: "Ola", total: "10.00", paidAmount: "10.00", dueAmount: "0.00", currency: "EUR", paid: true, eventId: "EV", at: new Date().toISOString() };
+  const yesterday = dayKeyInTimeZone(new Date(Date.now() - 86_400_000), "UTC");
+  const older = dayKeyInTimeZone(new Date(Date.now() - 3 * 86_400_000), "UTC");
+  await limits.put(`webhook:paid:${UTC_DAY()}`, JSON.stringify([{ ...base, id: "INV-TODAY" }]));
+  await limits.put(`webhook:paid:${yesterday}`, JSON.stringify([{ ...base, id: "INV-YESTERDAY" }]));
+  await limits.put(`webhook:paid:${older}`, JSON.stringify([{ ...base, id: "INV-OLD" }]));
+  const r = await call(envWith(pp, limits), "/api/unpaid");
+  assert.equal(r.status, 200);
+  const ids = (r.body.paidToday as Array<{ id: string }>).map((i) => i.id).sort();
+  assert.deepEqual(ids, ["INV-TODAY", "INV-YESTERDAY"]);
 });
 
 test("status endpoint reads PayPal live and returns status, paid amount and due amount", async () => {
@@ -224,7 +253,7 @@ test("unpaid drops an invoice whose stored webhook status is PAID and shows it i
     paidAmount: "75.00", dueAmount: "0.00", currency: "EUR", paid: true, eventId: "EV-P", at: "2026-10-18T10:00:00Z",
   };
   await limits.put("webhook:invoice:INV-P", JSON.stringify(record));
-  await limits.put(`webhook:paid:${DAY()}`, JSON.stringify([record]));
+  await limits.put(`webhook:paid:${UTC_DAY()}`, JSON.stringify([record]));
   const r = await call(envWith(pp, limits), "/api/unpaid");
   assert.equal(r.status, 200);
   const list = r.body.invoices as Array<{ id: string }>;
@@ -270,6 +299,45 @@ test("admin register-webhook registers the worker URL for the three events and r
       { name: "INVOICING.INVOICE.REFUNDED" },
     ],
   });
+});
+
+test("R10: admin cancel-invoice is guarded exactly like register-webhook", async () => {
+  const missing = await call(envWith(fakePayPal()), "/api/admin/cancel-invoice", { invoiceIds: ["INV2-1"] });
+  assert.equal(missing.status, 503);
+  const pp = fakePayPal();
+  const wrong = await call(envWith(pp, kv(), { ADMIN_CODE: "admin-secret" }), "/api/admin/cancel-invoice", { invoiceIds: ["INV2-1"] }, { "x-admin-code": "nope" });
+  assert.equal(wrong.status, 401);
+  assert.equal(pp.calls.filter((c) => c.path.endsWith("/cancel")).length, 0);
+});
+
+test("R10: admin cancel-invoice cancels each id with a note and no recipient sends", async () => {
+  const pp = fakePayPal();
+  const r = await call(envWith(pp, kv(), { ADMIN_CODE: "admin-secret" }), "/api/admin/cancel-invoice",
+    { invoiceIds: ["INV2-1", "INV2-2"] }, { "x-admin-code": "admin-secret" });
+  assert.equal(r.status, 200);
+  const results = r.body.results as Array<{ id: string; ok: boolean; status?: string }>;
+  assert.deepEqual(results.map((x) => x.id), ["INV2-1", "INV2-2"]);
+  assert.ok(results.every((x) => x.ok && x.status === "CANCELLED"));
+  const cancel = pp.calls.find((c) => c.path === "/v2/invoicing/invoices/INV2-1/cancel");
+  assert.ok(cancel);
+  assert.equal(cancel.method, "POST");
+  const body = cancel.body as { note?: string; send_to_invoicer?: boolean; send_to_recipient?: boolean };
+  assert.equal(typeof body.note, "string");
+  assert.ok((body.note ?? "").length > 0);
+  assert.equal(body.send_to_invoicer, false);
+  assert.equal(body.send_to_recipient, false);
+});
+
+test("R10: admin cancel-invoice refuses more than 50 ids and an id that is not a PayPal invoice id", async () => {
+  const pp = fakePayPal();
+  const env = envWith(pp, kv(), { ADMIN_CODE: "admin-secret" });
+  const many = await call(env, "/api/admin/cancel-invoice", { invoiceIds: Array.from({ length: 51 }, (_, i) => `INV2-${i}`) }, { "x-admin-code": "admin-secret" });
+  assert.equal(many.status, 422);
+  const bad = await call(env, "/api/admin/cancel-invoice", { invoiceIds: ["not an invoice id"] }, { "x-admin-code": "admin-secret" });
+  assert.equal(bad.status, 422);
+  const empty = await call(env, "/api/admin/cancel-invoice", { invoiceIds: [] }, { "x-admin-code": "admin-secret" });
+  assert.equal(empty.status, 422);
+  assert.equal(pp.calls.filter((c) => c.path.endsWith("/cancel")).length, 0);
 });
 
 test("record-payment that times out while PayPal is still working returns 202 pending, not an error", async () => {

@@ -192,3 +192,23 @@ test("R12: PayPal write routes are rate limited per address with a plain 429", a
   const other = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers: { ...headers, "cf-connecting-ip": "203.0.113.8" }, body: JSON.stringify({ id: "INV-X" }) }), env as never);
   assert.equal(other.status, 422);
 });
+
+test("R10: a rate limit store that throws fails open and logs once", async () => {
+  const pp = fakePayPal();
+  const throwing = { get: async () => { throw new Error("storage down"); }, put: async () => { throw new Error("storage down"); } };
+  const env = { ...envWith(pp, throwing as never) };
+  const headers = { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" };
+  const lines: string[] = [];
+  const real = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map((a) => String(a)).join(" ")); };
+  try {
+    // The limiter fails open: the request reaches the handler and its normal 422, never a 500 from the store.
+    const first = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers, body: JSON.stringify({ id: "INV-X" }) }), env as never);
+    assert.equal(first.status, 422);
+    const second = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers, body: JSON.stringify({ id: "INV-X" }) }), env as never);
+    assert.equal(second.status, 422);
+  } finally {
+    console.log = real;
+  }
+  assert.equal(lines.filter((l) => /rate limit/i.test(l)).length, 1);
+});

@@ -55,6 +55,15 @@ async function rateLimit(req: Request, env: Env, key: string): Promise<Response 
   return null;
 }
 
+/** The limiter is a brake, never a gate. When its store throws, let the request through and say so once. */
+let rateLimitWarned = false;
+function rateLimitUnavailable(err: unknown): void {
+  if (rateLimitWarned) return;
+  rateLimitWarned = true;
+  const reason = err instanceof Error ? err.message : String(err);
+  console.log(`rate limit store unavailable, allowing the request ${reason}`.trim());
+}
+
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 export const DAY_TIME_ZONE = "Europe/Warsaw";
 
@@ -68,6 +77,16 @@ export function dayKeyInTimeZone(date: Date, timeZone: string = DAY_TIME_ZONE): 
 /** The Paid today day key and the cash payment date, in Warsaw, so a late evening stays on the right day. */
 function today(): string {
   return dayKeyInTimeZone(new Date());
+}
+
+/** A paid record is stored under the UTC date, which every time zone can locate. */
+export function paidDayKey(date: Date = new Date()): string {
+  return dayKeyInTimeZone(date, "UTC");
+}
+
+/** The last two UTC days, so a visitor's local day is always one of them, wherever they are. */
+export function paidDayWindow(date: Date = new Date()): string[] {
+  return [paidDayKey(date), paidDayKey(new Date(date.getTime() - 86_400_000))];
 }
 
 function aiRunner(env: Env): AiRunner {
@@ -126,6 +145,35 @@ async function perAddress(req: Request, env: Env): Promise<void> {
 }
 
 const DRAFT_ID = /^[A-Za-z0-9]{8,16}$/;
+/** A PayPal invoice id, the shape the Invoicing v2 API returns. */
+const PAYPAL_INVOICE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{3,63}$/;
+/** The admin cancel route accepts at most this many ids in one request. */
+export const CANCEL_MAX_IDS = 50;
+
+/** Owner-only cancel for a batch of PayPal invoices, guarded exactly like the webhook setup route. */
+async function cancelInvoices(req: Request, env: Env): Promise<Response> {
+  if (!env.ADMIN_CODE) return Response.json({ error: "Invoice cancel is disabled because ADMIN_CODE is not set." }, { status: 503 });
+  if (!sameCode(headerValue(req, "x-admin-code", "admin-code", "admin_code"), env.ADMIN_CODE)) {
+    return Response.json({ error: "This action needs the admin code." }, { status: 401 });
+  }
+  const input = await body<{ invoiceIds?: unknown }>(req);
+  const ids = Array.isArray(input.invoiceIds) ? input.invoiceIds : null;
+  if (!ids || ids.length === 0) throw new ExtractError("Send a non-empty invoiceIds list.");
+  if (ids.length > CANCEL_MAX_IDS) throw new ExtractError(`Send at most ${CANCEL_MAX_IDS} invoice ids in one request.`);
+  if (!ids.every((id) => typeof id === "string" && PAYPAL_INVOICE_ID.test(id))) throw new ExtractError("Every invoice id must look like a PayPal invoice id.");
+  const pp = paypal(env);
+  const results: Array<{ id: string; ok: boolean; status?: string; error?: string }> = [];
+  for (const id of ids as string[]) {
+    try {
+      await pp.cancel(id);
+      results.push({ id, ok: true, status: "CANCELLED" });
+    } catch (err) {
+      results.push({ id, ok: false, error: err instanceof PayPalError ? err.message : "The invoice could not be cancelled." });
+    }
+  }
+  return Response.json({ results });
+}
+
 interface SentRecord { invoiceId: string; sent: boolean; hash: string }
 
 /** Short content hash of the validated draft: a retry is the same invoice only if the content is the same. */
@@ -201,13 +249,24 @@ async function storedStatus(env: Env, id: string): Promise<WebhookRecord | null>
 }
 
 async function paidToday(env: Env): Promise<WebhookRecord[]> {
-  const list = await readJson<WebhookRecord[]>(env.LIMITS, `${PAID_TODAY_PREFIX}${today()}`);
-  return Array.isArray(list) ? list.filter((r) => r && PAID_STATUSES.has(r.status)) : [];
+  const keys = paidDayWindow().map((day) => `${PAID_TODAY_PREFIX}${day}`);
+  const lists = await Promise.all(keys.map((key) => readJson<WebhookRecord[]>(env.LIMITS, key)));
+  const out: WebhookRecord[] = [];
+  const seen = new Set<string>();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const record of list) {
+      if (!record || !PAID_STATUSES.has(record.status) || seen.has(record.id)) continue;
+      seen.add(record.id);
+      out.push(record);
+    }
+  }
+  return out;
 }
 
 async function addPaidToday(env: Env, record: WebhookRecord): Promise<void> {
   if (!env.LIMITS) return;
-  const key = `${PAID_TODAY_PREFIX}${today()}`;
+  const key = `${PAID_TODAY_PREFIX}${paidDayKey()}`;
   const list = (await readJson<WebhookRecord[]>(env.LIMITS, key)) ?? [];
   const next = list.filter((r) => r && r.id !== record.id);
   next.push(record);
@@ -389,6 +448,7 @@ const routes: Record<string, Handler> = {
   },
   "POST /api/paypal/webhook": async (req, env) => handleWebhook(req, env),
   "POST /api/admin/register-webhook": async (req, env) => registerWebhook(req, env),
+  "POST /api/admin/cancel-invoice": async (req, env) => cancelInvoices(req, env),
 };
 
 /** Match the fixed routes plus the two per-invoice routes, and keep one guard key for each. */
@@ -408,14 +468,20 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
     const route = matchRoute(request.method, pathname);
-    if (route) {
-      const limited = await rateLimit(request, env, route.key);
-      if (limited) return limited;
-    }
-    if (route && env.DEMO_SEND_CODE && GUARDED.has(route.key) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
-      return Response.json({ error: "This action needs the access code.", needCode: true }, { status: 401 });
-    }
     if (!route) return pathname.startsWith("/api/") ? Response.json({ error: "Not found." }, { status: 404 }) : env.ASSETS.fetch(request);
-    try { return await route.handler(request, env); } catch (err) { return fail(err); }
+    try {
+      // The rate limiter lives inside this try, so a store failure fails open instead of blocking the request.
+      let limited: Response | null = null;
+      try {
+        limited = await rateLimit(request, env, route.key);
+      } catch (err) {
+        rateLimitUnavailable(err);
+      }
+      if (limited) return limited;
+      if (env.DEMO_SEND_CODE && GUARDED.has(route.key) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
+        return Response.json({ error: "This action needs the access code.", needCode: true }, { status: 401 });
+      }
+      return await route.handler(request, env);
+    } catch (err) { return fail(err); }
   },
 };

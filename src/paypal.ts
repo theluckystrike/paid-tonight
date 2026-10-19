@@ -104,6 +104,14 @@ export class PayPal {
     await this.request("DELETE", `/v2/invoicing/invoices/${encodeURIComponent(id)}`);
   }
 
+  /** Cancel a sent invoice with a short note and no emails, for the owner-only admin route. */
+  async cancel(id: string, note = "Cancelled by the seller"): Promise<void> {
+    await this.request("POST", `/v2/invoicing/invoices/${encodeURIComponent(id)}/cancel`, {
+      body: JSON.stringify({ note, send_to_invoicer: false, send_to_recipient: false }),
+      contentType: "application/json",
+    });
+  }
+
   async get(id: string): Promise<unknown> {
     const res = await this.request("GET", `/v2/invoicing/invoices/${encodeURIComponent(id)}`);
     return res.json();

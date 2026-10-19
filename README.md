@@ -24,10 +24,10 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 
 ## How it works
 
-1. You type or speak the job. The browser's speech recognition fills the text box.
+1. You type or speak the job. The browser's speech recognition fills the text box, and a voice language picker follows your browser language until you choose one.
 2. The AI reads it and returns the customer, the email, each item with quantity and unit price, a discount amount or percentage in any language, the tax rate and a short note. It never does the arithmetic. The job text is passed to the model as data inside tags, and the model is told to ignore instructions in it.
 3. The server checks every field and computes the totals itself with exact integer cents, the way PayPal does. A percentage discount bakes into the unit prices by reducing each unit price and taking the difference from the original line, which is how PayPal rounds a line; tax is computed per line on the discounted line amount, each rounded half up. A fixed discount is split across the lines in exact cents, the leftover cents going on a quantity 1 line, and baked into the unit prices the same way when each line's share divides exactly by its quantity; when it cannot, PayPal takes the discount at invoice level, after tax, and the draft carries a warning that VAT is charged on the full price. A discount the model writes as an item is turned back into a discount, and a percentage discount such as "10 percent off", "10 % Rabatt" or "descuento del 15 %" is applied to every line. Tax rates may have up to 3 decimals. Customer honorifics are removed before the name is split, and a Polish name after u, dla or od gets a warning to check it. Currency words count only next to an amount, so a "euro cylinder lock" stays an item. A currency it cannot invoice (yen, forints) is refused instead of becoming dollars. An email that does not look valid, or does not appear in your description, is flagged, links are removed from the note, and amounts above 100,000 are refused. Warnings you should check also cover a zero price, a zero total after a 100 percent discount, and a tax or discount that is mentioned but not applied.
-4. You correct anything in the preview (customer, items, currency, discount amount or percent, tax) and tap "Send with PayPal". A discount amount and a discount percent that disagree are refused with a warning instead of one being dropped. The server validates the edited draft again, creates the invoice with an invoice number tied to this draft and its content (a retry can never create or email a second invoice, and a corrected draft is never sent as the old one), reads back PayPal's own total and sends only if it equals the total you saw. You get the invoice number, the pay link and the PayPal QR code. Without an email, PayPal emails nobody and you share the QR code or link.
+4. You correct anything in the preview (customer, items, currency, discount amount or percent, tax) and tap "Send with PayPal". When a draft gives both a discount amount and a discount percent, the percent wins and the amount box shows the discount the server computes, read only. The server validates the edited draft again, creates the invoice with an invoice number tied to this draft and its content (a retry can never create or email a second invoice, and a corrected draft is never sent as the old one), reads back PayPal's own total and sends only if it equals the total you saw. You get the invoice number, the pay link and the PayPal QR code, and the success card follows PayPal's status every 5 seconds and also on Refresh. Without an email, PayPal emails nobody and you share the QR code or link.
 5. In the Unpaid tab, the reminder agent reads your open invoices from PayPal and drafts a message, friendly when the invoice is due or slightly late and firm after 14 days. PayPal's reminder endpoint ignores custom text, so the app says so. "Send PayPal reminder" sends PayPal's standard reminder with the pay button, and "Email this message" opens your own email with the drafted text.
 6. The success card shows the total at once, reads the invoice back from PayPal every 5 seconds for up to 2 minutes, and also on Refresh. It shows Unpaid for any status PayPal has not settled, then becomes a green Paid state when PayPal says PAID or MARKED_AS_PAID, and stops polling. "Paid in cash" asks for a confirmation, records the payment with PayPal as CASH for the full amount due, then reads the invoice again and keeps polling. The Unpaid tab drops an invoice that a verified webhook reported as paid and shows it in a small Paid today list.
 
@@ -46,6 +46,7 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 | `POST /v2/invoicing/invoices/{id}/payments` | Record a cash payment at the door for the amount due, with method CASH and today's date |
 | `POST /v1/notifications/verify-webhook-signature` | Verify every PayPal webhook with its transmission headers and `PAYPAL_WEBHOOK_ID` |
 | `POST /v1/notifications/webhooks` | Register the worker webhook URL for PAID, CANCELLED and REFUNDED |
+| `POST /v2/invoicing/invoices/{id}/cancel` | Cancel a batch of invoices from the owner-only admin route, with a short note and no emails |
 
 ## App endpoints
 
@@ -55,6 +56,7 @@ Plumbers, electricians, cleaners, tutors, dog walkers and anyone else who does t
 | `POST /api/invoice/{id}/record-payment` | Record a confirmed cash payment through PayPal, guarded like send |
 | `POST /api/paypal/webhook` | Verify and store PAID, CANCELLED and REFUNDED events, idempotent by event id |
 | `POST /api/admin/register-webhook` | Owner-only setup, needs the `ADMIN_CODE` secret in the `x-admin-code` header |
+| `POST /api/admin/cancel-invoice` | Owner-only cancel of up to 50 PayPal invoices, guarded exactly like the webhook setup route |
 
 ## Webhooks
 
@@ -81,7 +83,7 @@ The cash flow is honest about its source. The demo marks a cash payment through 
 |---|---|
 | Workers AI, `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Reads the job description and returns structured JSON (customer, items, tax, note). Validated with zod, with one retry that appends the error, then a plain error. |
 | Same model | Drafts the reminder message from the invoice data (tone from the real due date). Length and tone are checked in code. |
-| Browser Web Speech API | Speech to text on the device, for the microphone button. |
+| Browser Web Speech API | Speech to text on the device, for the microphone button. A language picker (Polish, English, German, Dutch) follows the browser language until the speaker picks one. |
 
 The public demo has a daily cap of 60 AI calls so it stays inside the free allowance, and a Cloudflare rate limiting binding is configured at 6 AI calls a minute per address. Cloudflare applies it per location and approximately, so it is a brake rather than a hard cap. Run it yourself to remove the cap.
 
@@ -108,7 +110,7 @@ npx wrangler secret put DEMO_SEND_CODE        # optional, an access code for sen
 npx wrangler secret put ADMIN_CODE            # required only for the webhook setup route
 npx wrangler secret put PAYPAL_WEBHOOK_ID     # after the setup route returns the webhook id
 npx wrangler dev
-npx tsx --test test/*.test.ts                 # 204 tests, no network (PayPal is a fake in the tests)
+npx tsx --test test/*.test.ts                 # 218 tests, no network (PayPal is a fake in the tests)
 ```
 
 ## License

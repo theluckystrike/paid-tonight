@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, POLL_ENDED_MESSAGE, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang } from "../web/app.js";
 import { totals } from "../src/money";
 import { validateDraft } from "../src/validate";
 import type { InvoiceDraft } from "../src/types";
@@ -235,8 +235,8 @@ test("R12: the poller shows the first UNPAID read and stops on a paid read", asy
     intervalMs: 5,
     maxMs: 120,
     now: () => 0,
-    setIntervalFn: (fn) => { scheduled = fn; return 7; },
-    clearIntervalFn: () => { cleared += 1; },
+    setTimeoutFn: (fn) => { scheduled = fn; return 7; },
+    clearTimeoutFn: () => { cleared += 1; },
   });
   assert.equal(typeof scheduled, "function");
   await poller.tick();
@@ -260,8 +260,8 @@ test("R12: the poller stops at the 2 minute limit", async () => {
     onStatus: (status) => seen.push(status),
     maxMs: 100,
     now: () => clock,
-    setIntervalFn: () => 1,
-    clearIntervalFn: () => { cleared += 1; },
+    setTimeoutFn: () => 1,
+    clearTimeoutFn: () => { cleared += 1; },
   });
   await poller.tick();
   assert.equal(cleared, 0);
@@ -270,6 +270,53 @@ test("R12: the poller stops at the 2 minute limit", async () => {
   assert.equal(cleared, 1);
   await poller.tick();
   assert.equal(seen.length, 2);
+});
+
+test("R10: the poller self schedules and reports the quiet end after 2 minutes", async () => {
+  let clock = 0;
+  let scheduled = 0;
+  let ended = 0;
+  const poller = createInvoicePoller({
+    fetchStatus: async () => ({ status: "UNPAID", paid: false }),
+    onStatus: () => undefined,
+    maxMs: 100,
+    now: () => clock,
+    setTimeoutFn: () => { scheduled += 1; return scheduled; },
+    clearTimeoutFn: () => undefined,
+    onEnd: () => { ended += 1; },
+  });
+  // The first tick is scheduled by a timeout, not an interval, so ticks cannot overlap.
+  assert.ok(scheduled >= 1);
+  await poller.tick();
+  assert.equal(ended, 0);
+  clock = 100;
+  await poller.tick();
+  assert.equal(ended, 1);
+  await poller.tick();
+  assert.equal(ended, 1);
+  assert.equal(POLL_ENDED_MESSAGE, "Checked PayPal for 2 minutes, tap Refresh");
+});
+
+test("R10: a new invoice clears the running status poller", () => {
+  assert.match(app, /function stopActiveStatusPoller\(\)/);
+  assert.match(app, /async function handleMake\(ui\) \{[\s\S]*?stopActiveStatusPoller\(\)/);
+  assert.match(app, /function showSuccess\(ui, result\) \{[\s\S]*?stopActiveStatusPoller\(\)/);
+  assert.match(app, /createInvoicePoller\(\{[\s\S]*?onEnd:[\s\S]*?POLL_ENDED_MESSAGE/);
+});
+
+test("R10: a percent above 100 is clamped in the preview and warns instead of a negative total", () => {
+  const draft = {
+    customerName: "A", customerEmail: null, currency: "EUR", taxPercent: null, note: null, warnings: [], discountPercent: "150",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }],
+  };
+  const t = computeTotals(draft);
+  assert.equal(t.total, "0.00");
+  assert.equal(Number(t.total) < 0, false);
+  assert.equal(Number(t.discount) <= Number(t.subtotal), true);
+  assert.ok(computeWarnings(draft).includes("Percent must be 100 or less"));
+  const choice = discountChoice(draft);
+  assert.equal(choice.locked, true);
+  assert.equal(Number(choice.amount) <= 200, true);
 });
 
 test("R12: the success card shows the send total at once and starts the poller", () => {

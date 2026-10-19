@@ -42,6 +42,7 @@ export function saveSpeechLang(lang: string): void;
 
 export const POLL_INTERVAL_MS: number;
 export const POLL_MAX_MS: number;
+export const POLL_ENDED_MESSAGE: string;
 
 export function shouldStopPolling(status: unknown): boolean;
 export function statusHeadline(status: unknown): string;
@@ -50,11 +51,12 @@ export function createInvoicePoller(options: {
   fetchStatus: () => Promise<unknown>;
   onStatus: (status: unknown) => void;
   onError?: (err: unknown) => void;
+  onEnd?: () => void;
   intervalMs?: number;
   maxMs?: number;
   now?: () => number;
-  setIntervalFn?: (fn: () => void, ms: number) => unknown;
-  clearIntervalFn?: (timer: unknown) => void;
+  setTimeoutFn?: (fn: () => void, ms: number) => unknown;
+  clearTimeoutFn?: (timer: unknown) => void;
 }): { stop: () => void; tick: () => Promise<void> };
 
 export function reminderMailto(invoice: BrowserInvoice, subject: string, note: string): string;

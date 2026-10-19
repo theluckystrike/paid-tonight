@@ -392,3 +392,36 @@ test("R12: a text that names both a percent and a fixed amount gives one clear w
   assert.ok(aboutDiscount[0]!.includes("5.00"));
   assert.ok(aboutDiscount[0]!.includes("20.00"));
 });
+
+test("R10: a percent and a currency amount named in the text warn even when the amount is the percent share", async () => {
+  // The model repeats the percent share (20.00) in the amount field, but the text still names both discounts.
+  const draft = await extractDraft("2 hours at 100 for Ola, 10 percent off and 20 euro off", aiOnce(draftJson({ currency: "EUR", discount: "20.00", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
+  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
+  assert.ok(aboutDiscount[0]!.includes("10%"));
+  assert.ok(aboutDiscount[0]!.includes("20.00"));
+});
+
+test("R10: the same rule sees a word such as mniej or minus next to the amount", async () => {
+  for (const text of ["2 hours at 100, 10 % Rabatt und 20 euro mniej", "2 hours at 100, 10 percent off and minus 20 discount"]) {
+    const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "20.00", discountPercent: "10",
+      items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+    assert.equal(draft.discountPercent, "10", text);
+    const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
+    assert.equal(aboutDiscount.length, 1, `${text}: ${aboutDiscount.join(" | ")}`);
+    assert.ok(aboutDiscount[0]!.includes("20.00"), text);
+  }
+});
+
+test("R10: a lone percent with no currency amount keeps the single applied warning", async () => {
+  const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: null, discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
+  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
+  assert.equal(aboutDiscount[0], "Discount of 10% applied for 20.00");
+});

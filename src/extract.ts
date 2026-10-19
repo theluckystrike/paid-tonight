@@ -372,6 +372,25 @@ function percentFromText(text: string): string | null {
   return value ? value.replace(",", ".") : null;
 }
 
+// A currency amount written next to a discount word, so "10 percent off and 5 euro off" is seen as two discounts
+// even when the model repeats only the percent share in its amount field.
+const DISCOUNT_AMOUNT_WORDS = "off|less|minus|mniej|rabatt|rabat|korting|descuento|remise|sconto|discount|rebate|sleva|alennus";
+const MONEY_CURRENCY = String.raw`(?:€|£|\$|zł|PLN|EUR|GBP|USD|euro?s?|dollars?|pounds?|zlotys?|złotych)`;
+// A number that is not itself a percentage: "15 %" next to a discount word is the percent, not a second amount.
+const MONEY_AMOUNT = String.raw`(\d+(?:[.,]\d{1,2})?)(?!\s*(?:%|percent|per cent))`;
+const AMOUNT_WITH_DISCOUNT = new RegExp(
+  `${MONEY_AMOUNT}\\s*(?:${MONEY_CURRENCY})?\\s*(?:${DISCOUNT_AMOUNT_WORDS})\\b` +
+  `|\\b(?:${DISCOUNT_AMOUNT_WORDS})\\s*(?:(?:del|de|di|van|von|of|do|z)\\s*)?(?:${MONEY_CURRENCY}\\s*)?${MONEY_AMOUNT}`,
+  "iu",
+);
+
+/** The currency amount named next to a discount word, as a plain decimal, or null. */
+function amountFromText(text: string): string | null {
+  const m = AMOUNT_WITH_DISCOUNT.exec(text);
+  const value = m ? (m[1] ?? m[2] ?? "") : "";
+  return value ? value.replace(",", ".") : null;
+}
+
 function normalize(raw: RawDraft, text: string): InvoiceDraft {
   const warnings: string[] = [];
   let fixedDiscount = raw.discount == null ? 0n : scaleRound(raw.discount, 2) ?? 0n;
@@ -395,6 +414,7 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
   if (subtotal >= TOTAL_BLOCK_CENTS) throw new ExtractError("The total is above 100,000. Check the amounts and try again.");
   // A percentage discount is a share of the work, not that number in money: compute it from the subtotal in code.
   const textPercent = percentFromText(text);
+  const textAmount = amountFromText(text);
   const percentValue = raw.discountPercent == null ? textPercent : formatPercent(raw.discountPercent);
   const rawName = (raw.customerName ?? "").trim();
   const customerName = stripHonorific(rawName) || "Customer";
@@ -422,9 +442,12 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
     // in the preview shows the discount the server computes, read-only.
     draft.discountPercent = appliedPercent;
     const baked = totals(draft).discount;
-    if (extraFixed > 0n) {
+    // The text itself may name a currency amount next to a discount word, even when the model's amount is the percent share.
+    const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
+    const bothAmount = extraFixed > 0n ? extraFixed : namedAmount;
+    if (bothAmount > 0n) {
       // One clear message instead of both an "applied" line and a mismatch line that contradict each other.
-      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(extraFixed)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
+      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(bothAmount)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
     } else {
       warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
       if (textPercent != null) {

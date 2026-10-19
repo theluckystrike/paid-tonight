@@ -164,6 +164,43 @@ function largestSingleLine(lines, qScaled) {
   return best;
 }
 
+function clampPercent(pct) {
+  if (pct > 10000n) return 10000n;
+  if (pct < 0n) return 0n;
+  return pct;
+}
+
+// Same rule as the server (src/money.ts): a percentage bakes by reducing each unit price; when rounding moves the
+// effective rate by more than half a point it moves to a quantity 1 line, or PayPal takes it at invoice level.
+function percentPlan(lines, unitCents, qScaled, pct, percent) {
+  const subtotal = lines.reduce((a, b) => a + b, 0n);
+  const factor = 10000n - pct;
+  const reduced = unitCents.map((cents) => (cents * factor + 5000n) / 10000n);
+  const reducedLines = reduced.map((cents, i) => lineCentsFor(qScaled[i], cents));
+  const lineDiscount = reducedLines.map((rl, i) => lines[i] - rl);
+  const totalDiscount = lineDiscount.reduce((a, b) => a + b, 0n);
+  if (offByMoreThanHalfPoint(totalDiscount, subtotal, pct)) {
+    const target = (subtotal * pct + 5000n) / 10000n;
+    const single = largestSingleLine(lines, qScaled);
+    if (single >= 0) {
+      const others = totalDiscount - lineDiscount[single];
+      let share = target - others;
+      if (share < 0n) share = 0n;
+      if (share > lines[single]) share = lines[single];
+      const adjusted = lineDiscount.slice();
+      const adjustedUnits = reduced.slice();
+      adjusted[single] = share;
+      adjustedUnits[single] = unitCents[single] - share;
+      const adjustedTotal = adjusted.reduce((a, b) => a + b, 0n);
+      if (!offByMoreThanHalfPoint(adjustedTotal, subtotal, pct)) {
+        return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, warning: null };
+      }
+    }
+    return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, warning: INVOICE_DISCOUNT_WARNING };
+  }
+  return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, warning: null };
+}
+
 function discountPlan(draft) {
   const qScaled = draft.items.map((item) => scaledDecimal(item.quantity, 3));
   const unitCents = draft.items.map((item) => scaledDecimal(item.unitAmount, 2));
@@ -171,40 +208,17 @@ function discountPlan(draft) {
   const subtotal = lines.reduce((a, b) => a + b, 0n);
   const percent = draft.discountPercent != null && String(draft.discountPercent).trim() !== "" ? String(draft.discountPercent).trim() : null;
   const fixed = draft.discount != null && String(draft.discount).trim() !== "" ? String(draft.discount).trim() : null;
-  if (percent != null && fixed != null) {
-    const pct = scaledDecimal(percent, 2);
-    const share = (subtotal * pct + 5000n) / 10000n;
-    if (scaledDecimal(fixed, 2) !== share) {
-      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
-    }
-  }
   if (percent != null) {
-    const pct = scaledDecimal(percent, 2);
-    const factor = 10000n - pct;
-    const reduced = unitCents.map((cents) => (cents * factor + 5000n) / 10000n);
-    const reducedLines = reduced.map((cents, i) => lineCentsFor(qScaled[i], cents));
-    const lineDiscount = reducedLines.map((rl, i) => lines[i] - rl);
-    const totalDiscount = lineDiscount.reduce((a, b) => a + b, 0n);
-    if (offByMoreThanHalfPoint(totalDiscount, subtotal, pct)) {
-      const target = (subtotal * pct + 5000n) / 10000n;
-      const single = largestSingleLine(lines, qScaled);
-      if (single >= 0) {
-        const others = totalDiscount - lineDiscount[single];
-        let share = target - others;
-        if (share < 0n) share = 0n;
-        if (share > lines[single]) share = lines[single];
-        const adjusted = lineDiscount.slice();
-        const adjustedUnits = reduced.slice();
-        adjusted[single] = share;
-        adjustedUnits[single] = unitCents[single] - share;
-        const adjustedTotal = adjusted.reduce((a, b) => a + b, 0n);
-        if (!offByMoreThanHalfPoint(adjustedTotal, subtotal, pct)) {
-          return { lines, unitCents: adjustedUnits, lineDiscount: adjusted, totalDiscount: adjustedTotal, baked: true, percent, warning: null };
-        }
+    // The preview clamps the percent to 0 to 100, so a typed 150 cannot turn the total negative.
+    const pct = clampPercent(scaledDecimal(percent, 2));
+    const plan = percentPlan(lines, unitCents, qScaled, pct, percent);
+    if (fixed != null) {
+      const share = (subtotal * pct + 5000n) / 10000n;
+      if (scaledDecimal(fixed, 2) !== share && scaledDecimal(fixed, 2) !== plan.totalDiscount) {
+        return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: 0n, baked: false, percent: null, warning: BOTH_DISCOUNTS_WARNING };
       }
-      return { lines, unitCents, lineDiscount: lines.map(() => 0n), totalDiscount: target, baked: false, percent, warning: INVOICE_DISCOUNT_WARNING };
     }
-    return { lines, unitCents: reduced, lineDiscount, totalDiscount, baked: true, percent, warning: null };
+    return plan;
   }
   if (fixed != null) {
     let discount = scaledDecimal(fixed, 2);
@@ -553,6 +567,9 @@ function computeWarnings(draft) {
   const warnings = [];
   const plan = discountPlan(draft);
   if (plan.warning) warnings.push(plan.warning);
+  // A percent above 100 is clamped for the totals, and the field says why instead of a negative total.
+  const percent = draft.discountPercent == null ? NaN : Number(String(draft.discountPercent).trim());
+  if (Number.isFinite(percent) && percent > 100) warnings.push("Percent must be 100 or less");
   if (!draft.customerEmail) warnings.push("No customer email. The customer can pay by scanning the QR code.");
   if (!draft.customerName || !draft.customerName.trim()) warnings.push("No customer name.");
   for (const item of draft.items) {
@@ -827,6 +844,8 @@ async function handleMake(ui) {
     showError(ui.newError, "Describe the job first.");
     return;
   }
+  // A new invoice replaces any card that is still polling, so no old poller lingers.
+  stopActiveStatusPoller();
   ui.makeBtn.disabled = true;
   ui.makeBtn.textContent = "Working...";
   clearError(ui.newError);
@@ -861,6 +880,15 @@ async function handleSend(ui, sendBtn) {
 // invoice is paid. Everything is plain script, so the strict CSP needs no inline code.
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_MS = 120000;
+const POLL_ENDED_MESSAGE = "Checked PayPal for 2 minutes, tap Refresh";
+
+// One poller lives at a time. Starting a new invoice clears the previous one so two cards can never tick together.
+let activeStatusPoller = null;
+function stopActiveStatusPoller() {
+  if (!activeStatusPoller) return;
+  activeStatusPoller.stop();
+  activeStatusPoller = null;
+}
 
 function shouldStopPolling(status) {
   if (!status) return false;
@@ -873,22 +901,28 @@ function statusHeadline(status) {
 }
 
 // A small injectable poller so the behaviour is testable without a browser. fetchStatus returns a normalized status.
+// It re-schedules itself with a timeout only after a tick finishes, so two ticks can never overlap.
 function createInvoicePoller(options) {
   const intervalMs = options.intervalMs == null ? POLL_INTERVAL_MS : options.intervalMs;
   const maxMs = options.maxMs == null ? POLL_MAX_MS : options.maxMs;
   const now = options.now || (() => Date.now());
-  const setIntervalFn = options.setIntervalFn || setInterval;
-  const clearIntervalFn = options.clearIntervalFn || clearInterval;
+  const setTimeoutFn = options.setTimeoutFn || setTimeout;
+  const clearTimeoutFn = options.clearTimeoutFn || clearTimeout;
   const started = now();
   let stopped = false;
   let timer = null;
   const stop = () => {
     if (stopped) return;
     stopped = true;
-    if (timer != null) clearIntervalFn(timer);
+    if (timer != null) { clearTimeoutFn(timer); timer = null; }
+  };
+  const schedule = () => {
+    if (stopped) return;
+    timer = setTimeoutFn(tick, intervalMs);
   };
   const tick = async () => {
     if (stopped) return;
+    // The pending timeout is left in place until stop or the next schedule replaces it, so stop can always clear it.
     let status = null;
     try {
       status = await options.fetchStatus();
@@ -902,9 +936,14 @@ function createInvoicePoller(options) {
         return;
       }
     }
-    if (now() - started >= maxMs) stop();
+    if (now() - started >= maxMs) {
+      stop();
+      if (options.onEnd) options.onEnd();
+      return;
+    }
+    schedule();
   };
-  timer = setIntervalFn(tick, intervalMs);
+  schedule();
   return { stop, tick };
 }
 
@@ -923,21 +962,22 @@ function buildStatusBox(invoiceId, initial, onPaid) {
   actions.append(refreshBtn, cashBtn);
 
   let last = initial;
-  let poller = null;
 
   const stopPolling = () => {
-    if (!poller) return;
-    poller.stop();
-    poller = null;
+    if (activeStatusPoller) {
+      activeStatusPoller.stop();
+      activeStatusPoller = null;
+    }
   };
 
   const startPolling = () => {
     stopPolling();
-    poller = createInvoicePoller({
+    activeStatusPoller = createInvoicePoller({
       fetchStatus: () => invoiceStatusRequest(invoiceId),
       onStatus: (status) => apply(status),
       // A failed poll keeps the last good status on screen; it is not an error the seller has to act on.
       onError: () => undefined,
+      onEnd: () => { if (!last || !last.paid) detail.textContent = POLL_ENDED_MESSAGE; },
     });
   };
 
@@ -1004,6 +1044,8 @@ function buildStatusBox(invoiceId, initial, onPaid) {
 }
 
 function showSuccess(ui, result) {
+  // A new invoice gets a fresh poller and the previous one is cleared.
+  stopActiveStatusPoller();
   ui.preview.hidden = true;
   const card = el("div", "card card--success");
   card.append(el("h2", "card__title", result.emailed ? "Invoice sent" : "Invoice ready"));
@@ -1046,7 +1088,7 @@ function showSuccess(ui, result) {
 
   const againBtn = el("button", "btn btn--primary", "Make another");
   againBtn.type = "button";
-  againBtn.addEventListener("click", () => { ui.success.replaceChildren(); ui.success.hidden = true; state.draftId = null; ui.jobText.value = ""; ui.jobText.focus(); });
+  againBtn.addEventListener("click", () => { stopActiveStatusPoller(); ui.success.replaceChildren(); ui.success.hidden = true; state.draftId = null; ui.jobText.value = ""; ui.jobText.focus(); });
   card.append(againBtn);
 
   ui.success.replaceChildren(card);
@@ -1353,6 +1395,7 @@ export {
   paidTodayFor,
   POLL_INTERVAL_MS,
   POLL_MAX_MS,
+  POLL_ENDED_MESSAGE,
   shouldStopPolling,
   statusHeadline,
   createInvoicePoller,

@@ -657,6 +657,23 @@ test("register-webhook: posts the URL and the three invoice event types", async 
   });
 });
 
+test("R10: cancel posts the cancel endpoint with a short note and no recipient sends", async () => {
+  const { fetch, calls } = makeFetch((req) =>
+    req.path === "/v1/oauth2/token" ? tokenResponse() : new Response(null, { status: 204 }),
+  );
+  const pp = new PayPal("cid", "sec", fetch);
+  await pp.cancel("INV2-2");
+  const cancel = calls.find((c) => c.path === "/v2/invoicing/invoices/INV2-2/cancel");
+  assert.ok(cancel);
+  assert.equal(cancel.method, "POST");
+  assert.equal(cancel.headers["Authorization"], "Bearer tok123");
+  const body = JSON.parse(cancel.body ?? "{}") as { note?: string; send_to_invoicer?: boolean; send_to_recipient?: boolean };
+  assert.equal(typeof body.note, "string");
+  assert.ok((body.note ?? "").length > 0);
+  assert.equal(body.send_to_invoicer, false);
+  assert.equal(body.send_to_recipient, false);
+});
+
 function openInvoice(id: string, extra: Record<string, unknown> = {}): Response {
   return json({
     id, status: "UNPAID", detail: { invoice_number: id },
