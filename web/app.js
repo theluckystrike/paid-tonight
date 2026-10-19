@@ -13,6 +13,30 @@ const EXAMPLES = {
   cleaner: "Deep cleaned a three-bedroom flat for Priya Shah, priya@example.com, 4 hours at 35 an hour, plus 20 percent VAT.",
 };
 
+const SPEECH_LANGS = ["pl-PL", "en-US", "de-DE", "nl-NL"];
+
+// The microphone follows the browser language unless the seller picks one. The choice is remembered per browser.
+function resolveSpeechLang(browserLang, saved) {
+  for (const candidate of [saved, browserLang]) {
+    if (!candidate) continue;
+    const text = String(candidate).trim();
+    const exact = SPEECH_LANGS.find((lang) => lang.toLowerCase() === text.toLowerCase());
+    if (exact) return exact;
+    const base = text.split("-")[0].toLowerCase();
+    const byBase = SPEECH_LANGS.find((lang) => lang.toLowerCase().split("-")[0] === base);
+    if (byBase) return byBase;
+  }
+  return "en-US";
+}
+
+function loadSavedSpeechLang() {
+  try { return localStorage.getItem("pt-speech-lang"); } catch (err) { return null; }
+}
+
+function saveSpeechLang(lang) {
+  try { localStorage.setItem("pt-speech-lang", lang); } catch (err) { /* private mode: the picker still works on this page */ }
+}
+
 class ApiError extends Error {
   constructor(status, message) {
     super(message);
@@ -316,7 +340,9 @@ function reminderMailto(invoice, subject, note) {
   if (!invoice || !invoice.customerEmail) return "";
   const payUrl = safeHref(invoice.payUrl);
   const body = [String(note || "").trim(), payUrl ? `Pay online at ${payUrl}` : ""].filter(Boolean).join("\n\n");
-  return "mailto:" + encodeURIComponent(invoice.customerEmail) + "?subject=" + encodeURIComponent(String(subject || "").trim()) + "&body=" + encodeURIComponent(body);
+  // A masked address cannot receive mail, so the draft opens without a recipient for the seller to fill in.
+  const to = String(invoice.customerEmail).includes("*") ? "" : encodeURIComponent(invoice.customerEmail);
+  return "mailto:" + to + "?subject=" + encodeURIComponent(String(subject || "").trim()) + "&body=" + encodeURIComponent(body);
 }
 
 function asText(value, fallback) {
@@ -454,6 +480,8 @@ async function sendDraftRequest(draft, fetchFn) {
     qr: asText(data.qr, ""),
     href: asText(data.href, ""),
     amount: data.amount && data.amount.value ? `${data.amount.value} ${asText(data.amount.currency, "")}` : "",
+    total: data.totals && data.totals.total != null ? moneyText(data.totals.total) : data.amount && data.amount.value ? moneyText(data.amount.value) : "",
+    currency: currencyOf(data.currency || (data.amount && data.amount.currency)),
     emailed: Boolean(data.emailed),
     partial: Boolean(data.partial),
   };
@@ -502,6 +530,7 @@ async function draftReminderRequest(id, fetchFn) {
     subject: asText(r.subject, ""),
     note: asText(r.note, ""),
     tone: asText(r.tone, "friendly"),
+    customerEmail: data.customerEmail ? asText(data.customerEmail, "") : null,
   };
 }
 
@@ -828,6 +857,57 @@ async function handleSend(ui, sendBtn) {
   }
 }
 
+// The success card polls PayPal every 5 seconds for up to 2 minutes, then stops. It stops earlier as soon as the
+// invoice is paid. Everything is plain script, so the strict CSP needs no inline code.
+const POLL_INTERVAL_MS = 5000;
+const POLL_MAX_MS = 120000;
+
+function shouldStopPolling(status) {
+  if (!status) return false;
+  return status.paid === true || status.status === "PAID" || status.status === "MARKED_AS_PAID";
+}
+
+// PayPal can report an invoice as UNPAID. The card says Unpaid for anything not settled, never the placeholder SENT.
+function statusHeadline(status) {
+  return status && status.paid ? "Paid" : "Unpaid";
+}
+
+// A small injectable poller so the behaviour is testable without a browser. fetchStatus returns a normalized status.
+function createInvoicePoller(options) {
+  const intervalMs = options.intervalMs == null ? POLL_INTERVAL_MS : options.intervalMs;
+  const maxMs = options.maxMs == null ? POLL_MAX_MS : options.maxMs;
+  const now = options.now || (() => Date.now());
+  const setIntervalFn = options.setIntervalFn || setInterval;
+  const clearIntervalFn = options.clearIntervalFn || clearInterval;
+  const started = now();
+  let stopped = false;
+  let timer = null;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer != null) clearIntervalFn(timer);
+  };
+  const tick = async () => {
+    if (stopped) return;
+    let status = null;
+    try {
+      status = await options.fetchStatus();
+    } catch (err) {
+      if (options.onError) options.onError(err);
+    }
+    if (status) {
+      options.onStatus(status);
+      if (shouldStopPolling(status)) {
+        stop();
+        return;
+      }
+    }
+    if (now() - started >= maxMs) stop();
+  };
+  timer = setIntervalFn(tick, intervalMs);
+  return { stop, tick };
+}
+
 function buildStatusBox(invoiceId, initial, onPaid) {
   const box = el("div", "status-box");
   const line = el("p", "status-box__line");
@@ -843,19 +923,39 @@ function buildStatusBox(invoiceId, initial, onPaid) {
   actions.append(refreshBtn, cashBtn);
 
   let last = initial;
+  let poller = null;
+
+  const stopPolling = () => {
+    if (!poller) return;
+    poller.stop();
+    poller = null;
+  };
+
+  const startPolling = () => {
+    stopPolling();
+    poller = createInvoicePoller({
+      fetchStatus: () => invoiceStatusRequest(invoiceId),
+      onStatus: (status) => apply(status),
+      // A failed poll keeps the last good status on screen; it is not an error the seller has to act on.
+      onError: () => undefined,
+    });
+  };
 
   const apply = (status) => {
     last = status;
     const paid = Boolean(status && status.paid);
     box.classList.toggle("status-box--paid", paid);
-    line.textContent = paid ? "Paid" : `Status ${status.status || "unknown"}`;
+    line.textContent = statusHeadline(status);
     const bits = [];
     if (status.total && Number(status.total) > 0) bits.push(`Total ${formatMoney(status.total, status.currency)}`);
     if (paid) bits.push(`Paid ${formatMoney(status.paidAmount, status.currency)}`);
     else if (status.dueAmount != null) bits.push(`Due ${formatMoney(status.dueAmount, status.currency)}`);
     detail.textContent = bits.join(" \u00b7 ");
     cashBtn.hidden = paid;
-    if (paid && typeof onPaid === "function") onPaid(status);
+    if (paid) {
+      stopPolling();
+      if (typeof onPaid === "function") onPaid(status);
+    }
   };
 
   refreshBtn.addEventListener("click", async () => {
@@ -885,8 +985,10 @@ function buildStatusBox(invoiceId, initial, onPaid) {
         line.textContent = result.message;
         detail.textContent = "";
         cashBtn.hidden = true;
+        startPolling();
       } else {
         apply(result.status);
+        if (!result.status || !result.status.paid) startPolling();
       }
     } catch (err) {
       showError(errorBox, friendlyMessage(err));
@@ -897,6 +999,7 @@ function buildStatusBox(invoiceId, initial, onPaid) {
 
   apply(initial);
   box.append(line, detail, errorBox, actions);
+  startPolling();
   return box;
 }
 
@@ -907,7 +1010,14 @@ function showSuccess(ui, result) {
   card.append(el("p", "muted", result.emailed ? "PayPal emailed it to your customer. They can also scan to pay now." : "No email on the invoice: show the QR code or share the pay link."));
   card.append(el("p", "success__number", `Invoice ${result.number || result.id || ""}${result.amount ? " \u00b7 " + result.amount : ""}`));
   if (result.partial) card.append(el("p", "muted", "The invoice is sent. PayPal did not return every detail just now; open it from the Unpaid tab."));
-  if (result.id) card.append(buildStatusBox(result.id, { status: "SENT", total: "", paidAmount: "0.00", dueAmount: null, currency: "", paid: false }, null));
+  if (result.id) card.append(buildStatusBox(result.id, {
+    status: "SENT",
+    total: result.total || "",
+    paidAmount: "0.00",
+    dueAmount: result.total || null,
+    currency: result.currency || (state.draft && state.draft.currency) || "",
+    paid: false,
+  }, null));
 
   if (result.qr) {
     const img = document.createElement("img");
@@ -1089,8 +1199,9 @@ function buildReminderEditor(ui, invoice, reminder) {
     try { await navigator.clipboard.writeText(note.value.trim()); copyBtn.textContent = "Copied"; } catch (err) { showError(errorBox, "Copy failed: select the message and copy it."); }
   });
   emailBtn.addEventListener("click", () => {
-    if (!invoice.customerEmail) { showError(errorBox, "This invoice has no customer email."); return; }
-    window.location.href = reminderMailto(invoice, subject.value, note.value);
+    const email = reminder.customerEmail || invoice.customerEmail;
+    if (!email) { showError(errorBox, "This invoice has no customer email."); return; }
+    window.location.href = reminderMailto({ ...invoice, customerEmail: email }, subject.value, note.value);
   });
   sendBtn.addEventListener("click", async () => {
     sendBtn.disabled = true;
@@ -1122,6 +1233,11 @@ function wireChips(ui) {
 }
 
 function wireSpeech(ui) {
+  const browserLang = typeof navigator !== "undefined" ? navigator.language : "";
+  if (ui.speechLang) {
+    ui.speechLang.value = resolveSpeechLang(browserLang, loadSavedSpeechLang());
+    ui.speechLang.addEventListener("change", () => saveSpeechLang(ui.speechLang.value));
+  }
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) {
     ui.micBtn.disabled = true;
@@ -1136,7 +1252,7 @@ function wireSpeech(ui) {
       return;
     }
     recognition = new SR();
-    recognition.lang = "en-US";
+    recognition.lang = (ui.speechLang && ui.speechLang.value) || resolveSpeechLang(browserLang, loadSavedSpeechLang());
     recognition.interimResults = false;
     recognition.maxAlternatives = 1;
     recognition.onresult = (event) => {
@@ -1190,6 +1306,7 @@ function grabElements() {
     panelNew: byId("panel-new"),
     panelUnpaid: byId("panel-unpaid"),
     jobText: byId("job-text"),
+    speechLang: byId("speech-lang"),
     micBtn: byId("mic-btn"),
     makeBtn: byId("make-btn"),
     newError: byId("new-error"),
@@ -1229,8 +1346,16 @@ export {
   decimalText,
   moneyText,
   formatMoney,
+  resolveSpeechLang,
+  loadSavedSpeechLang,
+  saveSpeechLang,
   localDay,
   paidTodayFor,
+  POLL_INTERVAL_MS,
+  POLL_MAX_MS,
+  shouldStopPolling,
+  statusHeadline,
+  createInvoicePoller,
   daysOverdue,
   calendarDaysPastDue,
   qrDataUrl,

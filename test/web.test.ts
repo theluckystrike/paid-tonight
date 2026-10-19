@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor } from "../web/app.js";
+import { normalizeUnpaid, overdueLabel, reminderMailto, recordPaymentRequest, computeTotals, computeWarnings, discountChoice, localDay, paidTodayFor, POLL_INTERVAL_MS, POLL_MAX_MS, shouldStopPolling, statusHeadline, createInvoicePoller, resolveSpeechLang, loadSavedSpeechLang, saveSpeechLang } from "../web/app.js";
 import { totals } from "../src/money";
 import { validateDraft } from "../src/validate";
 import type { InvoiceDraft } from "../src/types";
 
 const css = readFileSync(new URL("../web/styles.css", import.meta.url), "utf8");
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+const html = readFileSync(new URL("../web/index.html", import.meta.url), "utf8");
 
 test("R5: a partially paid invoice keeps both its total and its due amount", () => {
   const invoice = normalizeUnpaid({
@@ -205,4 +206,108 @@ test("R11: the Paid today list keeps only the browser's local calendar day", () 
   assert.deepEqual(paidTodayFor(rows, new Date(2030, 0, 1)).map((r) => r.id), ["D"]);
   const noTime = [{ id: "E", at: undefined }];
   assert.deepEqual(paidTodayFor(noTime, now).map((r) => r.id), ["E"]);
+});
+
+test("R12: the success card says Unpaid, never the SENT placeholder, and stops when settled", () => {
+  assert.equal(statusHeadline({ status: "UNPAID", paid: false }), "Unpaid");
+  assert.equal(statusHeadline({ status: "SENT", paid: false }), "Unpaid");
+  assert.equal(statusHeadline({ status: "PAID", paid: true }), "Paid");
+  assert.equal(POLL_INTERVAL_MS, 5000);
+  assert.equal(POLL_MAX_MS, 120000);
+  assert.equal(shouldStopPolling({ status: "UNPAID", paid: false }), false);
+  assert.equal(shouldStopPolling({ status: "PAID", paid: false }), true);
+  assert.equal(shouldStopPolling({ status: "MARKED_AS_PAID", paid: false }), true);
+  assert.equal(shouldStopPolling({ status: "SENT", paid: true }), true);
+});
+
+test("R12: the poller shows the first UNPAID read and stops on a paid read", async () => {
+  const statuses = [
+    { status: "UNPAID", paid: false },
+    { status: "PAID", paid: true, paidAmount: "10.00", total: "10.00" },
+  ];
+  let calls = 0;
+  let scheduled: (() => void) | null = null;
+  let cleared = 0;
+  const seen: Array<{ status?: string; paid?: boolean }> = [];
+  const poller = createInvoicePoller({
+    fetchStatus: async () => statuses[Math.min(calls++, statuses.length - 1)],
+    onStatus: (status) => seen.push(status as { status?: string; paid?: boolean }),
+    intervalMs: 5,
+    maxMs: 120,
+    now: () => 0,
+    setIntervalFn: (fn) => { scheduled = fn; return 7; },
+    clearIntervalFn: () => { cleared += 1; },
+  });
+  assert.equal(typeof scheduled, "function");
+  await poller.tick();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.status, "UNPAID");
+  assert.equal(cleared, 0);
+  await poller.tick();
+  assert.equal(seen.length, 2);
+  assert.equal(seen[1]!.status, "PAID");
+  assert.equal(cleared, 1);
+  await poller.tick();
+  assert.equal(seen.length, 2);
+});
+
+test("R12: the poller stops at the 2 minute limit", async () => {
+  let clock = 0;
+  let cleared = 0;
+  const seen: unknown[] = [];
+  const poller = createInvoicePoller({
+    fetchStatus: async () => ({ status: "UNPAID", paid: false }),
+    onStatus: (status) => seen.push(status),
+    maxMs: 100,
+    now: () => clock,
+    setIntervalFn: () => 1,
+    clearIntervalFn: () => { cleared += 1; },
+  });
+  await poller.tick();
+  assert.equal(cleared, 0);
+  clock = 100;
+  await poller.tick();
+  assert.equal(cleared, 1);
+  await poller.tick();
+  assert.equal(seen.length, 2);
+});
+
+test("R12: the success card shows the send total at once and starts the poller", () => {
+  assert.match(app, /function sendDraftRequest\(draft, fetchFn\)[\s\S]*?total: data\.totals/);
+  assert.match(app, /buildStatusBox\(result\.id, \{\s*status: "SENT",\s*total: result\.total/);
+  assert.match(app, /apply\(initial\);[\s\S]*?startPolling\(\);/);
+  assert.match(app, /function createInvoicePoller\(options\)/);
+});
+
+test("R12: the speech language follows the browser language and a saved picker choice", () => {
+  assert.equal(resolveSpeechLang("pl-PL", null), "pl-PL");
+  assert.equal(resolveSpeechLang("pl", null), "pl-PL");
+  assert.equal(resolveSpeechLang("de-AT", null), "de-DE");
+  assert.equal(resolveSpeechLang("nl-BE", null), "nl-NL");
+  assert.equal(resolveSpeechLang("fr-FR", null), "en-US");
+  assert.equal(resolveSpeechLang(null, "nl-NL"), "nl-NL");
+  // A saved choice wins over the browser language.
+  assert.equal(resolveSpeechLang("de-DE", "pl-PL"), "pl-PL");
+  assert.equal(resolveSpeechLang("", ""), "en-US");
+});
+
+test("R12: the picker offers Polish, English, German and Dutch and is remembered in localStorage with try and catch", () => {
+  for (const lang of ["pl-PL", "en-US", "de-DE", "nl-NL"]) assert.match(html, new RegExp(`value="${lang}"`));
+  assert.match(html, /id="speech-lang"/);
+  assert.match(app, /navigator\.language/);
+  assert.match(app, /recognition\.lang = \(ui\.speechLang && ui\.speechLang\.value\)/);
+  assert.match(app, /function loadSavedSpeechLang\(\) \{\s*try \{[\s\S]*?localStorage\.getItem[\s\S]*?\} catch \(err\) \{ return null; \}/);
+  assert.match(app, /function saveSpeechLang\(lang\) \{\s*try \{[\s\S]*?localStorage\.setItem[\s\S]*?\} catch \(err\)/);
+});
+
+test("R12: the saved speech language helpers do not throw when storage is unavailable", () => {
+  // Node has no localStorage, so the try and catch path is the one exercised here.
+  assert.equal(loadSavedSpeechLang(), null);
+  assert.doesNotThrow(() => saveSpeechLang("pl-PL"));
+});
+
+test("a masked customer email opens the reminder draft without a recipient", () => {
+  const url = reminderMailto({ customerEmail: "e***@example.com", payUrl: null }, "Invoice", "Hello");
+  assert.ok(url.startsWith("mailto:?subject="), url);
+  assert.ok(reminderMailto({ customerEmail: "ewa@example.com", payUrl: null }, "Invoice", "Hello").startsWith("mailto:ewa%40example.com?"));
 });

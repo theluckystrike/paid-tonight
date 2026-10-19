@@ -1,4 +1,5 @@
 import { z, type ZodError } from "zod";
+import { totals } from "./money.js";
 import { needsNameCheck, stripHonorific } from "./names.js";
 import { ExtractError } from "./types.js";
 import type { AiRunner, InvoiceDraft, LineItem } from "./types.js";
@@ -395,26 +396,6 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
   // A percentage discount is a share of the work, not that number in money: compute it from the subtotal in code.
   const textPercent = percentFromText(text);
   const percentValue = raw.discountPercent == null ? textPercent : formatPercent(raw.discountPercent);
-  let discountCents = fixedDiscount;
-  let appliedPercent: string | null = null;
-  if (percentValue != null) {
-    const hundredths = scaleRound(percentValue, 2);
-    if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
-      const share = (subtotal * hundredths + 5000n) / 10000n;
-      // A model may repeat the percent number or the computed share in the fixed discount field; count it once.
-      discountCents = fixedDiscount === hundredths || fixedDiscount === share ? share : share + fixedDiscount;
-      appliedPercent = percentValue;
-      warnings.push(`Discount of ${formatPercent(percentValue)}% applied for ${formatMoney(discountCents)}`);
-      if (textPercent != null) {
-        const textShare = (subtotal * (scaleRound(textPercent, 2) ?? 0n) + 5000n) / 10000n;
-        if (discountCents !== textShare) {
-          warnings.push(`Discount is ${formatMoney(discountCents)}, not ${formatPercent(textPercent)}% of the subtotal (${formatMoney(textShare)}); check it`);
-        }
-      }
-    }
-  }
-  if (discountCents > subtotal) throw new ExtractError("The discount is larger than the work billed.");
-  if (discountCents === 0n && /\b(discount|knock(ed)? off|minus|less|\d+\s*(%|percent)?\s*off|rabatt|descuento|remise|sconto|korting|rabat|sleva|alennus)\b/i.test(text)) warnings.push("Discount mentioned but not applied");
   const rawName = (raw.customerName ?? "").trim();
   const customerName = stripHonorific(rawName) || "Customer";
   if (!rawName) warnings.push("No customer name");
@@ -423,13 +404,46 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
   const currency = resolveCurrency(raw.currency, text, warnings);
   const taxPercent = raw.taxPercent == null ? null : formatPercent(raw.taxPercent);
   const note = cleanNote(raw.note, warnings);
+  const draft: InvoiceDraft = { customerName, customerEmail, currency, items, taxPercent, note, warnings };
+
+  let appliedPercent: string | null = null;
+  let extraFixed = 0n;
+  if (percentValue != null) {
+    const hundredths = scaleRound(percentValue, 2);
+    if (hundredths !== null && hundredths > 0n && hundredths <= 10000n) {
+      appliedPercent = percentValue;
+      const share = (subtotal * hundredths + 5000n) / 10000n;
+      // A model may repeat the percent number or the computed share in the fixed discount field; that is not a second discount.
+      if (fixedDiscount > 0n && fixedDiscount !== hundredths && fixedDiscount !== share) extraFixed = fixedDiscount;
+    }
+  }
+  if (appliedPercent != null) {
+    // A percent wins: the draft carries the percent alone, so no stale amount can block a later total. The amount box
+    // in the preview shows the discount the server computes, read-only.
+    draft.discountPercent = appliedPercent;
+    const baked = totals(draft).discount;
+    if (extraFixed > 0n) {
+      // One clear message instead of both an "applied" line and a mismatch line that contradict each other.
+      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(extraFixed)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
+    } else {
+      warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
+      if (textPercent != null) {
+        const textPercentValue = formatPercent(textPercent);
+        if (formatPercent(appliedPercent) !== textPercentValue) {
+          const textShare = (subtotal * (scaleRound(textPercent, 2) ?? 0n) + 5000n) / 10000n;
+          warnings.push(`Discount is ${baked}, not ${textPercentValue}% of the subtotal (${formatMoney(textShare)}); check it`);
+        }
+      }
+    }
+  } else if (fixedDiscount > 0n) {
+    if (fixedDiscount > subtotal) throw new ExtractError("The discount is larger than the work billed.");
+    draft.discount = formatMoney(fixedDiscount);
+  }
+  if (draft.discount == null && appliedPercent == null && /\b(discount|knock(ed)? off|minus|less|\d+\s*(%|percent)?\s*off|rabatt|descuento|remise|sconto|korting|rabat|sleva|alennus)\b/i.test(text)) warnings.push("Discount mentioned but not applied");
   if (items.some((it) => it.unitAmount === "0.00")) warnings.push("Item priced at 0");
   if (subtotal > 1_000_000n) warnings.push("Total above 10000");
   const saysNoTax = /\b(no|without|exempt from|excluding|zero)\s+(vat|tax)\b|\b(vat|tax)[\s-]*(free|exempt)\b/i.test(text);
   if (taxPercent === null && !saysNoTax && /(^|\W)(vat|tax)(\W|$)/i.test(text)) warnings.push("VAT mentioned but no tax percent");
-  const draft: InvoiceDraft = { customerName, customerEmail, currency, items, taxPercent, note, warnings };
-  if (discountCents > 0n) draft.discount = formatMoney(discountCents);
-  if (appliedPercent != null) draft.discountPercent = appliedPercent;
   return draft;
 }
 

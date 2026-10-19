@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extractDraft, type AiRunner } from "../src/extract.js";
+import { totals } from "../src/money";
 import { ExtractError } from "../src/types.js";
 
 type Messages = { role: string; content: string }[];
@@ -231,24 +232,30 @@ test("R6: an item with 'reduction' in its name is an item, and '10 percent off' 
   assert.equal(valve.discount, undefined);
   const pct = await extractDraft("2 hours at 50, valve 30, 10 percent off", aiOnce(draftJson({ discount: "10", items: [
     { name: "Labour", quantity: "2", unitAmount: "50", unit: "HOURS" }, { name: "Valve", quantity: "1", unitAmount: "30" }] })), TODAY);
-  assert.equal(pct.discount, "13.00");
+  // A percent wins: the draft carries the percent alone, so no stale amount can block /api/totals after an edit.
+  assert.equal(pct.discount, undefined);
+  assert.equal(pct.discountPercent, "10");
+  assert.ok(pct.warnings.some((w) => w.includes("Discount of 10% applied for 13.00")), pct.warnings.join(" | "));
 });
 
 test("R8: percentage discounts are a share of the subtotal in German and Spanish", async () => {
   const german = "3 Std. à 65,50 €, 19 % MwSt., 10 % Rabatt";
   const d1 = await extractDraft(german, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null,
     items: [{ name: "Arbeit", quantity: "3", unitAmount: "65.50", unit: "HOURS" }] })), TODAY);
-  assert.equal(d1.discount, "19.65");
+  assert.equal(d1.discount, undefined);
   assert.equal(d1.discountPercent, "10");
+  assert.ok(d1.warnings.some((w) => w.includes("19.65")), d1.warnings.join(" | "));
   const d2 = await extractDraft(german, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null,
     items: [{ name: "Arbeit", quantity: "3", unitAmount: "65.50", unit: "HOURS" }, { name: "Anfahrt", quantity: "1", unitAmount: "24.90" }] })), TODAY);
-  assert.equal(d2.discount, "22.14");
-  assert.notEqual(d2.discount, "10.00");
+  assert.equal(d2.discount, undefined);
+  assert.equal(d2.discountPercent, "10");
+  assert.ok(d2.warnings.some((w) => w.includes("22.14")), d2.warnings.join(" | "));
   const spanish = "1.250,00 €, 6 horas a 45 €, descuento del 15 %, IVA 21 %";
   const d3 = await extractDraft(spanish, aiOnce(draftJson({ currency: "EUR", taxPercent: "21", discount: null,
     items: [{ name: "Materiales", quantity: "1", unitAmount: "1250.00" }, { name: "Trabajo", quantity: "6", unitAmount: "45", unit: "HOURS" }] })), TODAY);
-  assert.equal(d3.discount, "228.00");
+  assert.equal(d3.discount, undefined);
   assert.equal(d3.discountPercent, "15");
+  assert.ok(d3.warnings.some((w) => w.includes("228.00")), d3.warnings.join(" | "));
 });
 
 test("R8: every required discount phrase is recognised", async () => {
@@ -260,14 +267,17 @@ test("R8: every required discount phrase is recognised", async () => {
   for (const [text, discount] of phrases) {
     const draft = await extractDraft(text, aiOnce(draftJson({ discount: null,
       items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
-    assert.equal(draft.discount, discount, text);
+    assert.equal(draft.discount, undefined, text);
+    assert.notEqual(draft.discountPercent, null, text);
+    assert.ok(draft.warnings.some((w) => w.includes(discount)), `${text}: ${draft.warnings.join(" | ")}`);
   }
 });
 
 test("R8: an applied percent that differs from the text is visible as a warning", async () => {
   const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: null, discountPercent: "5",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
-  assert.equal(draft.discount, "10.00");
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "5");
   assert.ok(draft.warnings.some((w) => w.includes("not 10% of the subtotal")), draft.warnings.join(" | "));
 });
 
@@ -288,7 +298,9 @@ test("R8: discountPercent above 100 or with more than 2 decimals is rejected", a
 test("R8: a percent returned as both a percent and the same computed amount is counted once", async () => {
   const draft = await extractDraft("10 % Rabatt", aiOnce(draftJson({ discount: "20.00", discountPercent: "10",
     items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
-  assert.equal(draft.discount, "20.00");
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  assert.ok(draft.warnings.some((w) => w.includes("Discount of 10% applied for 20.00")), draft.warnings.join(" | "));
 });
 
 test("R9: a European thousands amount reaches the draft as 1250.00, not 1.25", async () => {
@@ -298,8 +310,9 @@ test("R9: a European thousands amount reaches the draft as 1250.00, not 1.25", a
   assert.deepEqual(draft.items[0], { name: "Material", quantity: "1", unitAmount: "1250.00" });
   assert.equal(draft.items[1]!.unitAmount, "45.00");
   assert.ok(draft.warnings.some((w) => w.includes('Corrected "Material" from 1.25 to 1250.00')), draft.warnings.join(" | "));
-  assert.equal(draft.discount, "228.00");
+  assert.equal(draft.discount, undefined);
   assert.equal(draft.discountPercent, "15");
+  assert.ok(draft.warnings.some((w) => w.includes("228.00")), draft.warnings.join(" | "));
 });
 
 test("R9: a European number copied verbatim is normalised instead of rejected", async () => {
@@ -308,7 +321,9 @@ test("R9: a European number copied verbatim is normalised instead of rejected", 
     items: [{ name: "Material", quantity: "1", unitAmount: "1.250,00" }, { name: "Mano de obra", quantity: "6", unitAmount: "45", unit: "HOURS" }] })), TODAY);
   assert.equal(draft.items[0]!.unitAmount, "1250.00");
   assert.ok(!draft.warnings.some((w) => w.includes("Corrected")), draft.warnings.join(" | "));
-  assert.equal(draft.discount, "228.00");
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "15");
+  assert.ok(draft.warnings.some((w) => w.includes("228.00")), draft.warnings.join(" | "));
 });
 
 test("R9: an amount that is not in the description is flagged (German boiler job)", async () => {
@@ -348,4 +363,32 @@ test("R9: the prompt keeps item names and the note in the description's language
   assert.match(system, /1\.250,00/);
   assert.match(system, /1 250,50/);
   assert.match(system, /1'250\.00/);
+});
+
+test("R12: the German fractional hour percent warning shows the baked total, 147.82 not 147.83", async () => {
+  const text = "Arbeit bei Herrn Weber, 3,5 Std. à 65,50 €, Heizung 1249,00 €, 19 % MwSt., 10 % Rabatt";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", taxPercent: "19", discount: null, discountPercent: "10",
+    items: [{ name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" }, { name: "Heizung", quantity: "1", unitAmount: "1249.00" }] })), TODAY);
+  // The draft carries the percent alone, so it cannot block a later total.
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.items[0]!.quantity, "3.5");
+  // The warning names the same discount the totals line shows, because the per line rounding bakes 147.82, not 147.83.
+  assert.equal(totals(draft).discount, "147.82");
+  assert.equal(totals(draft).total, "1583.21");
+  assert.ok(draft.warnings.some((w) => w.includes("147.82")), draft.warnings.join(" | "));
+  assert.ok(!draft.warnings.some((w) => w.includes("147.83")), draft.warnings.join(" | "));
+});
+
+test("R12: a text that names both a percent and a fixed amount gives one clear warning", async () => {
+  const text = "2 hours at 50 for Ola, 10 percent off and another 5 euro off";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: "5", discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "200" }], taxPercent: null })), TODAY);
+  assert.equal(draft.discount, undefined);
+  assert.equal(draft.discountPercent, "10");
+  const aboutDiscount = draft.warnings.filter((w) => /discount|amount/i.test(w));
+  assert.equal(aboutDiscount.length, 1, aboutDiscount.join(" | "));
+  assert.ok(aboutDiscount[0]!.includes("10%"));
+  assert.ok(aboutDiscount[0]!.includes("5.00"));
+  assert.ok(aboutDiscount[0]!.includes("20.00"));
 });

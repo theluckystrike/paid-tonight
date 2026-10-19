@@ -28,13 +28,46 @@ const WEBHOOK_INVOICE_PREFIX = "webhook:invoice:";
 const PAID_TODAY_PREFIX = "webhook:paid:";
 const NOT_OPEN = new Set([...PAID_STATUSES, "CANCELLED", "REFUNDED"]);
 
+/** Show a customer email as its first letter, three stars and the domain, so the demo never shows a full address. */
+export function maskEmail(email: string | null | undefined): string | null {
+  const text = (email ?? "").trim();
+  const at = text.lastIndexOf("@");
+  if (at <= 0 || at === text.length - 1) return text || null;
+  return `${text[0]}***@${text.slice(at + 1)}`;
+}
+
+/** Write routes that talk to PayPal, one shared bucket per address. The webhook is never limited. */
+const RATE_LIMITED = new Set(["POST /api/send", "POST /api/reminder", "POST /api/remind", "POST /api/invoice/{id}/record-payment"]);
+export const WRITE_RATE_LIMIT_PER_HOUR = 20;
+
+/** A plain per-address brake on the PayPal write routes, using the same KV store as the webhook hints. */
+async function rateLimit(req: Request, env: Env, key: string): Promise<Response | null> {
+  if (!env.LIMITS || !RATE_LIMITED.has(key)) return null;
+  const ip = req.headers.get("cf-connecting-ip");
+  if (!ip) return null;
+  const hour = Math.floor(Date.now() / 3_600_000);
+  const storeKey = `rate:${ip}:${hour}`;
+  const used = Number((await env.LIMITS.get(storeKey)) ?? "0");
+  if (Number.isFinite(used) && used >= WRITE_RATE_LIMIT_PER_HOUR) {
+    return Response.json({ error: "Too many requests from this address. Wait an hour and try again." }, { status: 429 });
+  }
+  await env.LIMITS.put(storeKey, String((Number.isFinite(used) ? used : 0) + 1), { expirationTtl: 2 * 3600 });
+  return null;
+}
+
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-/** The local calendar day, so a payment made at 11pm sits under today, not tomorrow's UTC date. */
+export const DAY_TIME_ZONE = "Europe/Warsaw";
+
+/** A calendar day as YYYY-MM-DD in a named time zone, so it never depends on the Worker's UTC clock. */
+export function dayKeyInTimeZone(date: Date, timeZone: string = DAY_TIME_ZONE): string {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const value = (type: string) => parts.find((part) => part.type === type)?.value ?? "";
+  return `${value("year")}-${value("month")}-${value("day")}`;
+}
+
+/** The Paid today day key and the cash payment date, in Warsaw, so a late evening stays on the right day. */
 function today(): string {
-  const d = new Date();
-  const month = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${d.getFullYear()}-${month}-${day}`;
+  return dayKeyInTimeZone(new Date());
 }
 
 function aiRunner(env: Env): AiRunner {
@@ -334,7 +367,8 @@ const routes: Record<string, Handler> = {
     for (const invoice of await paypal(env).listUnpaid()) {
       const hint = await storedStatus(env, invoice.id);
       if (hint && NOT_OPEN.has(hint.status)) continue;
-      invoices.push(invoice);
+      // The demo hides the customer address: first letter, three stars, domain.
+      invoices.push({ ...invoice, customerEmail: maskEmail(invoice.customerEmail) });
     }
     return Response.json({ invoices, paidToday: await paidToday(env) });
   },
@@ -343,7 +377,8 @@ const routes: Record<string, Handler> = {
     const { id } = await body<{ id?: string }>(req);
     const inv = (await paypal(env).listUnpaid()).find((i) => i.id === id);
     if (!inv) throw new ExtractError("That invoice is not unpaid any more.");
-    return Response.json({ reminder: await draftReminder(inv, aiRunner(env), today()) });
+    // The full address goes only to a caller who passed the access code. Without a code anyone can call this, so it stays masked.
+    return Response.json({ reminder: await draftReminder(inv, aiRunner(env), today()), customerEmail: env.DEMO_SEND_CODE ? inv.customerEmail : maskEmail(inv.customerEmail) });
   },
   "POST /api/remind": async (req, env) => {
     const { id } = await body<{ id?: string }>(req);
@@ -373,6 +408,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
     const route = matchRoute(request.method, pathname);
+    if (route) {
+      const limited = await rateLimit(request, env, route.key);
+      if (limited) return limited;
+    }
     if (route && env.DEMO_SEND_CODE && GUARDED.has(route.key) && !sameCode(request.headers.get("x-demo-code") ?? "", env.DEMO_SEND_CODE)) {
       return Response.json({ error: "This action needs the access code.", needCode: true }, { status: 401 });
     }

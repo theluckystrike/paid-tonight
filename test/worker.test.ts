@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import worker, { maskEmail, WRITE_RATE_LIMIT_PER_HOUR } from "../src/worker.js";
 
 // A fake PayPal sandbox: records calls, keeps invoices by id, answers like the Invoicing v2 API.
 function fakePayPal(opts: { totalOverride?: string; qrFails?: boolean; payUrlAbsent?: boolean } = {}) {
@@ -138,6 +138,24 @@ test("N1: a corrected draft is never sent as the old invoice", async () => {
   assert.equal(pp.calls.filter((c) => c.path.endsWith("/send")).length, 1);
 });
 
+test("R12: an edited AI percent draft is accepted by /api/totals, one source of truth", async () => {
+  // The extractor returns a percent draft with no separate amount, so editing a number cannot leave a stale amount behind.
+  const percentDraft = {
+    customerName: "Herr Weber", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [], discountPercent: "10",
+    items: [
+      { name: "Arbeit", quantity: "3.5", unitAmount: "65.50", unit: "HOURS" as const },
+      { name: "Heizung", quantity: "1", unitAmount: "1249.00" },
+    ],
+  };
+  const before = await call(envWith(fakePayPal()), "/api/totals", { draft: percentDraft });
+  assert.equal(before.status, 200);
+  assert.equal((before.body.totals as { discount: string }).discount, "147.82");
+  percentDraft.items[0]!.quantity = "4";
+  const after = await call(envWith(fakePayPal()), "/api/totals", { draft: percentDraft });
+  assert.equal(after.status, 200);
+  assert.equal((after.body.totals as { discount: string }).discount, "151.10");
+});
+
 test("H5: with DEMO_SEND_CODE set, PayPal routes need the code; drafting does not", async () => {
   const pp = fakePayPal({ totalOverride: "106.41" });
   const env = { ...envWith(pp), DEMO_SEND_CODE: "s3cret-code" };
@@ -148,4 +166,29 @@ test("H5: with DEMO_SEND_CODE set, PayPal routes need the code; drafting does no
   assert.equal(res.status, 200);
   const totalsRes = await call(env, "/api/totals", { draft });
   assert.equal(totalsRes.status, 200);
+});
+
+test("R12: maskEmail keeps the first letter and the domain", () => {
+  assert.equal(maskEmail("anna@example.com"), "a***@example.com");
+  assert.equal(maskEmail("ola.nowak@firma.pl"), "o***@firma.pl");
+  assert.equal(maskEmail(""), null);
+  assert.equal(maskEmail(null), null);
+  assert.equal(maskEmail("not an email"), "not an email");
+});
+
+test("R12: PayPal write routes are rate limited per address with a plain 429", async () => {
+  const env = envWith(fakePayPal());
+  const headers = { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7" };
+  for (let i = 0; i < WRITE_RATE_LIMIT_PER_HOUR; i++) {
+    // No unpaid invoice, so each call fails fast with 422 until the bucket is full.
+    const res = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers, body: JSON.stringify({ id: "INV-X" }) }), env as never);
+    assert.equal(res.status, 422, `call ${i + 1}`);
+  }
+  const blocked = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers, body: JSON.stringify({ id: "INV-X" }) }), env as never);
+  assert.equal(blocked.status, 429);
+  const body = await blocked.json() as { error?: string };
+  assert.match(String(body.error), /^Too many requests from this address\./);
+  // Another address has its own bucket.
+  const other = await worker.fetch(new Request("http://x/api/remind", { method: "POST", headers: { ...headers, "cf-connecting-ip": "203.0.113.8" }, body: JSON.stringify({ id: "INV-X" }) }), env as never);
+  assert.equal(other.status, 422);
 });

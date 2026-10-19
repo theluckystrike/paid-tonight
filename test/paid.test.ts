@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import worker, { dayKeyInTimeZone } from "../src/worker.js";
 
 interface InvoiceRow {
   id: string;
@@ -112,11 +112,19 @@ function event(id: string, type: string, row: InvoiceRow) {
 
 const realFetch = globalThis.fetch;
 test.afterEach(() => { globalThis.fetch = realFetch; });
-/** The local calendar day, matching the worker's Paid today key and cash payment date. */
-const DAY = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-};
+/** The Warsaw calendar day, matching the worker's Paid today key and cash payment date. */
+const DAY = () => dayKeyInTimeZone(new Date(), "Europe/Warsaw");
+
+test("R12: the Paid today day key is the Warsaw date, including a Warsaw evening that crosses UTC midnight", () => {
+  // 22:30 UTC on 18 October is 00:30 on 19 October in Warsaw (CEST, UTC+2).
+  assert.equal(dayKeyInTimeZone(new Date("2026-10-18T22:30:00Z"), "Europe/Warsaw"), "2026-10-19");
+  // 21:30 UTC is still 23:30 on the same Warsaw day.
+  assert.equal(dayKeyInTimeZone(new Date("2026-10-18T21:30:00Z"), "Europe/Warsaw"), "2026-10-18");
+  // Winter time is UTC+1.
+  assert.equal(dayKeyInTimeZone(new Date("2026-12-31T23:30:00Z"), "Europe/Warsaw"), "2027-01-01");
+  // A UTC clock would call the first case the day before, which is the bug this fixes.
+  assert.equal(dayKeyInTimeZone(new Date("2026-10-18T22:30:00Z"), "UTC"), "2026-10-18");
+});
 
 test("status endpoint reads PayPal live and returns status, paid amount and due amount", async () => {
   const pp = fakePayPal();
@@ -224,6 +232,18 @@ test("unpaid drops an invoice whose stored webhook status is PAID and shows it i
   const paid = r.body.paidToday as Array<{ id: string; status: string }>;
   assert.equal(paid[0]?.id, "INV-P");
   assert.equal(paid[0]?.status, "PAID");
+});
+
+test("R12: /api/unpaid masks the customer email and keeps the domain", async () => {
+  const pp = fakePayPal();
+  const row = invoice("INV-M", "SENT", "20.00", "20.00", "Anna");
+  (row.primary_recipients as Array<{ billing_info: Record<string, unknown> }>)[0]!.billing_info.email_address = "anna@example.com";
+  pp.invoices.set("INV-M", row);
+  const r = await call(envWith(pp), "/api/unpaid");
+  assert.equal(r.status, 200);
+  const list = r.body.invoices as Array<{ customerEmail: string | null }>;
+  assert.equal(list[0]?.customerEmail, "a***@example.com");
+  assert.equal(JSON.stringify(r.body).includes("anna@example.com"), false);
 });
 
 test("admin register-webhook refuses when the secret is not set and when the header is wrong", async () => {

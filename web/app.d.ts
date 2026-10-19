@@ -36,6 +36,27 @@ export function localDay(date: Date | string | number): string | null;
 
 export function paidTodayFor<T extends { at?: string | null }>(records: T[], now?: Date | string | number): T[];
 
+export function resolveSpeechLang(browserLang?: string | null, saved?: string | null): string;
+export function loadSavedSpeechLang(): string | null;
+export function saveSpeechLang(lang: string): void;
+
+export const POLL_INTERVAL_MS: number;
+export const POLL_MAX_MS: number;
+
+export function shouldStopPolling(status: unknown): boolean;
+export function statusHeadline(status: unknown): string;
+
+export function createInvoicePoller(options: {
+  fetchStatus: () => Promise<unknown>;
+  onStatus: (status: unknown) => void;
+  onError?: (err: unknown) => void;
+  intervalMs?: number;
+  maxMs?: number;
+  now?: () => number;
+  setIntervalFn?: (fn: () => void, ms: number) => unknown;
+  clearIntervalFn?: (timer: unknown) => void;
+}): { stop: () => void; tick: () => Promise<void> };
+
 export function reminderMailto(invoice: BrowserInvoice, subject: string, note: string): string;
 export function overdueLabel(invoice: BrowserInvoice, today?: string): { text: string; className: string };
 export function daysOverdue(invoice: BrowserInvoice, today?: string): number | null;
