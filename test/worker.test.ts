@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker, { maskEmail, WRITE_RATE_LIMIT_PER_HOUR } from "../src/worker.js";
-import { computeTotals } from "../web/app.js";
 
 // A fake PayPal sandbox: records calls, keeps invoices by id, answers like the Invoicing v2 API.
 function fakePayPal(opts: { totalOverride?: string; qrFails?: boolean; payUrlAbsent?: boolean } = {}) {
@@ -155,18 +154,6 @@ test("R12: an edited AI percent draft is accepted by /api/totals, one source of 
   const after = await call(envWith(fakePayPal()), "/api/totals", { draft: percentDraft });
   assert.equal(after.status, 200);
   assert.equal((after.body.totals as { discount: string }).discount, "151.10");
-});
-
-test("R13: /api/totals matches the preview on a both-discounts draft", async () => {
-  const both = {
-    customerName: "Ola", customerEmail: null, currency: "EUR", taxPercent: "19", note: null, warnings: [],
-    discount: "5.00", discountPercent: "10",
-    items: [{ name: "Arbeit", quantity: "1", unitAmount: "200", unit: "HOURS" as const }],
-  };
-  const res = await call(envWith(fakePayPal()), "/api/totals", { draft: both });
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body.totals, computeTotals(both));
-  assert.deepEqual(res.body.totals, { subtotal: "200.00", discount: "25.00", tax: "34.20", total: "209.20" });
 });
 
 test("H5: with DEMO_SEND_CODE set, PayPal routes need the code; drafting does not", async () => {

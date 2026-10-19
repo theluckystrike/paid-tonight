@@ -509,25 +509,6 @@ test("R2: createDraft bakes a percentage discount into the unit prices and label
   assert.equal("discount" in body.items[0], false);
 });
 
-test("R13: createDraft sends the baked percent in the items and the fixed amount as an invoice discount", async () => {
-  const { fetch, calls } = makeFetch((req) =>
-    req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-BOTH" }, 201),
-  );
-  const pp = new PayPal("cid", "sec", fetch);
-  await pp.createDraft(baseDraft({
-    currency: "EUR", taxPercent: "19", discount: "5.00", discountPercent: "10",
-    items: [{ name: "Arbeit", quantity: "1", unitAmount: "200.00" }],
-  }), { businessName: "B" });
-  const create = calls.find((c) => c.path === "/v2/invoicing/invoices");
-  const body = JSON.parse(create?.body ?? "{}");
-  // The percent is baked into the unit price and labelled on the line.
-  assert.equal(body.items[0].unit_amount.value, "180.00");
-  assert.equal(body.items[0].description, "10% off included");
-  assert.equal(body.items[0].tax.percent, "19");
-  // The separate fixed amount is the invoice-level discount PayPal accepts.
-  assert.deepEqual(body.amount, { currency_code: "EUR", breakdown: { discount: { invoice_discount: { amount: { currency_code: "EUR", value: "5.00" } } } } });
-});
-
 test("R3: createDraft sends a 3 decimal tax percent as a string", async () => {
   const { fetch, calls } = makeFetch((req) =>
     req.path === "/v1/oauth2/token" ? tokenResponse() : json({ id: "INV-TAX" }, 201),

@@ -443,18 +443,14 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
     }
   }
   if (appliedPercent != null) {
+    const baked = totals(draft).discount;
+    // The text itself may name a currency amount next to a discount word, even when the model's amount is the percent share.
     const namedAmount = textAmount == null ? 0n : (scaleRound(textAmount, 2) ?? 0n);
     const bothAmount = extraFixed > 0n ? extraFixed : namedAmount;
     if (bothAmount > 0n) {
-      // The text names both a percent and a separate fixed amount, so both come off: the percent bakes into the unit
-      // prices and the fixed amount is added at invoice level. Refuse when together they would take off more than
-      // the work billed, the same way a lone fixed discount is refused.
-      draft.discount = formatMoney(bothAmount);
-      let plan: ReturnType<typeof totals>;
-      try { plan = totals(draft); } catch { throw new ExtractError("The discounts are larger than the work billed."); }
-      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(bothAmount)} amount, so ${plan.discount} comes off in total`);
+      // One clear message instead of both an "applied" line and a mismatch line that contradict each other.
+      warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(bothAmount)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
     } else {
-      const baked = totals(draft).discount;
       warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
       if (textPercent != null) {
         const textPercentValue = formatPercent(textPercent);
