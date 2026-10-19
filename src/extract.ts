@@ -460,12 +460,18 @@ function normalize(raw: RawDraft, text: string): InvoiceDraft {
       warnings.push(INVOICE_DISCOUNT_WARNING);
     } else {
       const baked = totals(draft).discount;
-      warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
-      if (textPercent != null) {
-        const textPercentValue = formatPercent(textPercent);
-        if (formatPercent(appliedPercent) !== textPercentValue) {
-          const textShare = (subtotal * (scaleRound(textPercent, 2) ?? 0n) + 5000n) / 10000n;
-          warnings.push(`Discount is ${baked}, not ${textPercentValue}% of the subtotal (${formatMoney(textShare)}); check it`);
+      if (namedAmount > 0n) {
+        // The text names an amount but the model left its fixed field empty, different or an echo, so only the percent
+        // is billed. Name the ignored amount so the seller checks whether a second discount was meant.
+        warnings.push(`Description names a ${formatPercent(appliedPercent)}% discount and a ${formatMoney(namedAmount)} amount, so the invoice applies the ${formatPercent(appliedPercent)}% discount of ${baked}, check it`);
+      } else {
+        warnings.push(`Discount of ${formatPercent(appliedPercent)}% applied for ${baked}`);
+        if (textPercent != null) {
+          const textPercentValue = formatPercent(textPercent);
+          if (formatPercent(appliedPercent) !== textPercentValue) {
+            const textShare = (subtotal * (scaleRound(textPercent, 2) ?? 0n) + 5000n) / 10000n;
+            warnings.push(`Discount is ${baked}, not ${textPercentValue}% of the subtotal (${formatMoney(textShare)}); check it`);
+          }
         }
       }
     }

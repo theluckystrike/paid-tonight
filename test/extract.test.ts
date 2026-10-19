@@ -418,6 +418,19 @@ test("R14: a percent and a separate fixed amount in the text are both billed, 18
   assert.ok(draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
 });
 
+test("R14: a named amount the model leaves out is not billed and the seller is told to check", async () => {
+  // The text names a second 5 euro off, but the model returns no fixed amount, so only the percent is billed and the
+  // draft carries the check it warning naming the amount the model ignored.
+  const text = "130 euro for Ola, 10 percent off and another 5 euro off";
+  const draft = await extractDraft(text, aiOnce(draftJson({ currency: "EUR", discount: null, discountPercent: "10",
+    items: [{ name: "Work", quantity: "1", unitAmount: "130" }], taxPercent: "23" })), TODAY);
+  assert.equal(draft.discountPercent, "10");
+  assert.equal(draft.discount, undefined);
+  assert.equal(totals(draft).discount, "13.00");
+  assert.ok(draft.warnings.some((w) => w.includes("10%") && w.includes("5.00") && w.includes("13.00") && w.includes("check it")), draft.warnings.join(" | "));
+  assert.ok(!draft.warnings.includes(INVOICE_DISCOUNT_WARNING), draft.warnings.join(" | "));
+});
+
 test("R14: a percent and a separate fixed amount in the text are both billed, Polish", async () => {
   // The amount is 30, not the 20 percent share, so it is a real second discount rather than an echo.
   const text = "Naprawa u Oli, 2 godziny po 100, rabat 10% i jeszcze 30 z\u0142 mniej";
