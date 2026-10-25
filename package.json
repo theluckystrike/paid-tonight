@@ -1,5 +1,6 @@
 {
   "name": "paid-tonight",
+  "repository": {"type": "git", "url": "theluckystrike/paid-tonight.git"},
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
